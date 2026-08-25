@@ -22,7 +22,7 @@ Requires Go 1.24 or newer.
 ## Quick start
 
 ```go
-var a arena.Arena // the zero value is usable, with 64 KiB chunks
+var a arena.StringArena // the zero value is usable, with 64 KiB chunks
 
 for _, batch := range batches {
     labels := make([]string, 0, len(batch))
@@ -39,15 +39,33 @@ for _, batch := range batches {
 }
 ```
 
+## The two types
+
+`Arena[T]` stores slices of any `T`. `StringArena` is an `Arena[byte]` with the
+string entry points added — it exists because a method cannot narrow its
+receiver's type parameter, so `Intern` cannot live on `Arena` itself. Everything
+`Arena[byte]` does is promoted onto it, and the embedded field is addressable as
+`a.Arena` for code that wants the plain arena.
+
+```go
+a := arena.New[Sample](1 << 20)   // 1 MiB chunks of Sample
+s := arena.NewStringArena(4096)   // 4 KiB chunks, plus Intern/StrRef/Str
+```
+
 ## Storing a value
 
-Three entry points, differing only in what you get back.
+Every entry point copies, and differs only in what you get back.
 
 | Call | Returns | Use it when |
 | --- | --- | --- |
-| `Intern(string) string` | a `string` view | the value is a string — label keys, field names, enum values |
-| `Append([]byte) []byte` | a `[]byte` view | the value is bytes, and you hold few enough views that pointers are free |
-| `AppendRef([]byte) Ref` | a pointer-free descriptor | you retain a great many descriptors across the batch |
+| `Arena[T].Append([]T) []T` | a `[]T` view | you hold few enough views that pointers are free |
+| `Arena[T].AppendRef([]T) Ref[T]` | a pointer-free descriptor | you retain a great many descriptors across the batch |
+| `StringArena.Intern(string) string` | a `string` view | the value is a string and you hold a bounded number |
+| `StringArena.StrRef(string) Ref[byte]` | a pointer-free descriptor | the value is a string and you retain a great many |
+
+`Value` resolves a `Ref[T]` back to a `[]T`; `Str` resolves one back to a
+`string`. They are the same descriptor, so the byte and string sides
+interoperate freely.
 
 Every view is **one contiguous slice**. A value that does not fit the current
 chunk starts a new chunk rather than being split, so nothing has to be
@@ -59,32 +77,34 @@ handed out earlier.
 
 ### Why `Ref` exists
 
-`Ref` locates a value by chunk index and range instead of by pointer, and
-`Value` resolves it:
+`Ref[T]` locates a value by chunk index and range instead of by pointer:
 
 ```go
-refs := make([]arena.Ref, 0, len(lines))
+refs := make([]arena.Ref[byte], 0, len(lines))
 for _, line := range lines {
-    refs = append(refs, a.AppendRef(line))
+    refs = append(refs, a.StrRef(line))
 }
 ...
 for _, r := range refs {
     if !r.Empty() {
-        w.Write(a.Value(r))
+        w.WriteString(a.Str(r))
     }
 }
 ```
 
-The extra indirection on every read buys two things. A `[]Ref` holds no
+The extra indirection on every read buys two things. A `[]Ref[T]` holds no
 pointers, so it is allocated noscan and the garbage collector skips it entirely
-— where a `[][]byte` puts a pointer in every element and is walked on every
-cycle. And a `Ref` is 12 bytes against a slice header's 24, which for a caller
-that retains descriptors is the same saving twice over.
+— where a `[][]byte` or `[]string` puts a pointer in every element and is walked
+on every cycle. And a `Ref` is 12 bytes against a string header's 16 or a slice
+header's 24, which for a caller that retains descriptors is the same saving
+twice over. Both hold whatever `T` is: `Ref[T]` is 12 pointer-free bytes even
+when `T` itself is full of pointers.
 
-The zero `Ref` is the absent value: `AppendRef` returns it for empty input,
-`Empty` reports it, and `Value` resolves it to `nil`. Three `int32`s is also
-what bounds it — offsets by the chunk size, the chunk index by the arena's
-total size.
+The type parameter is a phantom — it carries no field, and is there so a `Ref`
+cannot be resolved against an arena of some other element type.
+
+The zero `Ref` is the absent value: `AppendRef` and `StrRef` return it for empty
+input, `Empty` reports it, `Value` resolves it to `nil` and `Str` to `""`.
 
 ## Rewinding
 
@@ -98,26 +118,30 @@ would be the largest allocation it makes, so it does not. `Release` is for an
 owner that outlives its bytes — a pooled writer parked empty between batches,
 which should retain its per-value bookkeeping and none of the values.
 
-Two counters describe the arena: `Size` is the bytes stored since the last
-rewind, which is what you check against a payload budget, and `Retained` is the
-chunk capacity holding them, which is the actual footprint. A burst grows the
-chunk list and `Reset` never shrinks it, so `Retained` is the number a trim
-policy should watch.
+Two counters describe the arena, both in bytes whatever `T` is. `Size` is the
+bytes stored since the last rewind, which is what you check against a payload
+budget; `Retained` is the chunk capacity holding them, which is the actual
+footprint. A burst grows the chunk list and `Reset` never shrinks it, so
+`Retained` is the number a trim policy should watch.
 
 ## Sizing the chunk
 
-`New(chunkSize)` overrides the 64 KiB default. Chunk size decides the tail
-waste: a value that does not fit the current chunk starts a new one and strands
-the remainder, so size the chunk to the values. Interning short strings is
-comfortable at the default; accumulating large rows or blocks wants something
-closer to 1 MiB.
+`New[T](chunkBytes)` takes a **byte budget**, not a count of elements, and
+divides it down to a whole number of `T` (never below one). A wider `T` means
+fewer of them per chunk, not a bigger chunk — so the 64 KiB zero value stays
+sane for a 64-byte struct instead of quietly becoming 4 MiB.
+
+Chunk size decides the tail waste: a value that does not fit the current chunk
+starts a new one and strands the remainder, so size the chunk to the values.
+Interning short strings is comfortable at the default; accumulating large rows
+or blocks wants something closer to 1 MiB.
 
 Values larger than a whole chunk are handled but win nothing. `Append` and
 `Intern` give them a standalone copy that dies with the batch, keeping the
 reusable chunks a uniform size so one huge value cannot pin an oversized chunk
-for the arena's lifetime. `AppendRef` cannot do that — a `Ref` can only address
-chunk storage — so it gives the value a chunk of its own, which is *not*
-uniform and survives `Reset`. Only `Release` frees it.
+for the arena's lifetime. `AppendRef` and `StrRef` cannot do that — a `Ref` can
+only address chunk storage — so they give the value a chunk of its own, which is
+*not* uniform and survives `Reset`. Only `Release` frees it.
 
 ## The rules
 
@@ -128,34 +152,54 @@ caller to hold up the other end:
 2. **Every view must be dead before `Reset` or `Release`.** Nothing checks this.
    A view read afterwards sees whatever the next batch wrote there.
 3. **Never mutate what you were handed.** The views alias the arena's own
-   storage, and `Intern` hands back a string over bytes it still owns.
+   storage, and `Intern` and `Str` hand back strings over bytes it still owns.
+
+What the arena saves is object *count*, not scan work: for a `T` that contains
+pointers the chunks are still scanned, they are simply a handful of large
+objects rather than one per value. For a pointer-free `T` — bytes included — the
+chunks are noscan and the collector ignores them outright.
 
 Run your tests under `-race`; this package's own suite does, on every supported
 Go version, on Linux, macOS and Windows.
 
 ## Benchmarks
 
-`go test -bench=. ./...` — indicative numbers from one machine
-(Intel Core Ultra 9 185H, Go 1.26, linux/amd64), not a promise:
+`go test -bench=. ./...` — medians of five runs on one machine (Intel Core
+Ultra 9 185H, Go 1.26, linux/amd64). Indicative, not a promise.
 
-| Benchmark | Arena | One heap copy per value |
+Interning against the obvious alternative, one heap-allocated copy per value,
+with both sides holding a batch of 4096 live — a copy that dies immediately gets
+stack-allocated and proves nothing:
+
+| Value | `StringArena.Intern` | One heap copy per value |
 | --- | --- | --- |
-| Intern, 16 B | 6.7 ns/op, 0 allocs | 15.1 ns/op, 1 alloc |
-| Intern, 256 B | 8.7 ns/op, 0 allocs | 64.5 ns/op, 1 alloc |
-| Intern, 4 KiB | 121 ns/op, 0 allocs | 687 ns/op, 1 alloc |
+| 16 B | 7.0 ns/op, 0 allocs | 15.1 ns/op, 1 alloc |
+| 256 B | 9.6 ns/op, 0 allocs | 65.7 ns/op, 1 alloc |
+| 4 KiB | 181 ns/op, 0 allocs | 675 ns/op, 1 alloc |
 
-Both sides hold a batch of 4096 values live, because a copy that dies
-immediately gets stack-allocated and proves nothing.
+At 4 KiB a batch no longer fits the chunks, so that row is dominated by chunk
+allocation and moves by tens of percent between runs; the two smaller ones are
+stable to a few percent.
 
 The collector is the other half of the story. Holding 2²⁰ descriptors live and
-timing one full GC cycle over each form:
+timing one full GC cycle over each form — same bytes in the arena either way,
+only the descriptor slice differs:
 
-| Descriptors retained | GC cycle |
+| Descriptors retained | Width | GC cycle |
+| --- | --- | --- |
+| `[]Ref[byte]` | 12 B, noscan | **269 µs** |
+| `[][]byte` | 24 B, scanned | 2292 µs |
+| `[]string` | 16 B, scanned | 2410 µs |
+
+The element type costs nothing. Storing 256 bytes per call through arenas of
+different `T`, where the struct case also carries a pointer and so has scanned
+chunks:
+
+| Element type | Store |
 | --- | --- |
-| `[]Ref` (noscan) | 264 µs |
-| `[][]byte` (scanned) | 2191 µs |
-
-Same bytes in the arena either way; only the descriptor slice differs.
+| `byte` | 8.6 ns/op, 0 allocs |
+| `int64` | 8.8 ns/op, 0 allocs |
+| `struct{int64; float64; string}` | 9.2 ns/op, 0 allocs |
 
 ## Documentation
 

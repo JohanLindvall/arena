@@ -22,7 +22,7 @@ func BenchmarkIntern(b *testing.B) {
 		value := strings.Repeat("x", size)
 
 		b.Run(fmt.Sprintf("arena/%d", size), func(b *testing.B) {
-			a := New(defaultChunkSize)
+			a := NewStringArena(defaultChunkBytes)
 			kept := make([]string, 0, batch)
 			b.ReportAllocs()
 			for b.Loop() {
@@ -53,11 +53,11 @@ func BenchmarkIntern(b *testing.B) {
 // where a value larger than a chunk falls back to a standalone copy and the arena buys
 // nothing at all.
 func BenchmarkAppend(b *testing.B) {
-	for _, size := range []int{16, 256, 4096, defaultChunkSize + 1} {
+	for _, size := range []int{16, 256, 4096, defaultChunkBytes + 1} {
 		value := make([]byte, size)
 
 		b.Run(fmt.Sprintf("%d", size), func(b *testing.B) {
-			a := New(defaultChunkSize)
+			a := New[byte](defaultChunkBytes)
 			b.ReportAllocs()
 			n := 0
 			for b.Loop() {
@@ -79,7 +79,7 @@ func BenchmarkAppendRef(b *testing.B) {
 	value := make([]byte, 256)
 
 	b.Run("Append", func(b *testing.B) {
-		a := New(defaultChunkSize)
+		a := New[byte](defaultChunkBytes)
 		b.ReportAllocs()
 		n := 0
 		for b.Loop() {
@@ -93,7 +93,7 @@ func BenchmarkAppendRef(b *testing.B) {
 	})
 
 	b.Run("AppendRef", func(b *testing.B) {
-		a := New(defaultChunkSize)
+		a := New[byte](defaultChunkBytes)
 		b.ReportAllocs()
 		n := 0
 		for b.Loop() {
@@ -118,8 +118,8 @@ func BenchmarkRetainedDescriptorGC(b *testing.B) {
 	value := []byte(`{"ts":1755000000,"level":"info"}`)
 
 	b.Run("Ref", func(b *testing.B) {
-		a := New(defaultChunkSize)
-		refs := make([]Ref, n)
+		a := New[byte](defaultChunkBytes)
+		refs := make([]Ref[byte], n)
 		for i := range refs {
 			refs[i] = a.AppendRef(value)
 		}
@@ -131,10 +131,23 @@ func BenchmarkRetainedDescriptorGC(b *testing.B) {
 	})
 
 	b.Run("bytes", func(b *testing.B) {
-		a := New(defaultChunkSize)
+		a := New[byte](defaultChunkBytes)
 		views := make([][]byte, n)
 		for i := range views {
 			views[i] = a.Append(value)
+		}
+		for b.Loop() {
+			runtime.GC()
+		}
+		runtime.KeepAlive(views)
+		runtime.KeepAlive(a)
+	})
+
+	b.Run("strings", func(b *testing.B) {
+		a := NewStringArena(defaultChunkBytes)
+		views := make([]string, n)
+		for i := range views {
+			views[i] = a.Intern(string(value))
 		}
 		for b.Loop() {
 			runtime.GC()
@@ -156,8 +169,8 @@ func BenchmarkBatchCycle(b *testing.B) {
 	for _, rewind := range []string{"Reset", "Release"} {
 		release := rewind == "Release" // hoisted: not part of what is being measured
 		b.Run(rewind, func(b *testing.B) {
-			a := New(defaultChunkSize)
-			refs := make([]Ref, 0, len(values))
+			a := New[byte](defaultChunkBytes)
+			refs := make([]Ref[byte], 0, len(values))
 			b.ReportAllocs()
 			for b.Loop() {
 				refs = refs[:0]
@@ -175,5 +188,52 @@ func BenchmarkBatchCycle(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// BenchmarkElementWidth stores the same number of bytes through arenas of different
+// element types. The code per element is identical; what the width changes is how many
+// elements a chunk holds, since the chunk budget is bytes. The struct case also carries a
+// pointer, so its chunks are scanned where the other two are noscan.
+func BenchmarkElementWidth(b *testing.B) {
+	type row struct {
+		id    int64
+		score float64
+		name  string
+	}
+
+	b.Run("byte", func(b *testing.B) {
+		v := make([]byte, 32*8)
+		a := New[byte](defaultChunkBytes)
+		benchStore(b, a, v)
+	})
+	b.Run("int64", func(b *testing.B) {
+		v := make([]int64, 32)
+		a := New[int64](defaultChunkBytes)
+		benchStore(b, a, v)
+	})
+	b.Run("struct", func(b *testing.B) {
+		v := make([]row, 8)
+		for i := range v {
+			v[i] = row{id: int64(i), score: float64(i), name: "name"}
+		}
+		a := New[row](defaultChunkBytes)
+		benchStore(b, a, v)
+	})
+}
+
+// benchStore appends v repeatedly, rewinding every batch values so the arena carries its
+// share of a Reset rather than growing without bound.
+func benchStore[T any](b *testing.B, a *Arena[T], v []T) {
+	b.Helper()
+	b.ReportAllocs()
+	n := 0
+	for b.Loop() {
+		if n == batch {
+			a.Reset()
+			n = 0
+		}
+		_ = a.AppendRef(v)
+		n++
 	}
 }

@@ -34,14 +34,13 @@ linters:
     generated: lax
     presets:
       - comments
-      - common-false-positives
       - std-error-handling
     rules:
       # The package exists to hand out string and byte views over its own chunks
       # without copying, so unsafe is the mechanism rather than an oversight. What
       # makes it sound is documented on b2s, Append and Reset, and CI runs the
       # suite under -race.
-      - path: arena\.go
+      - path: strings\.go
         linters: [gosec]
         text: G103
       # Ref narrows to int32 under the invariant documented on the type: offsets
