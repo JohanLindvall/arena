@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Keeps the CI and release workflows on current action majors instead of letting
+  # them quietly rot on a version GitHub later stops running.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+    labels: [dependencies, ci]
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-modules:
+        patterns: ["*"]
+    commit-message:
+      prefix: deps
+    labels: [dependencies, go]

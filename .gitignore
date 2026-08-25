@@ -1,0 +1,10 @@
+# Test binaries and coverage output
+*.test
+*.out
+coverage.html
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

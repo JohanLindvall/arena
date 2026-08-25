@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# The default token only needs to read the checkout.
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes the run already in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # 1.24 is the floor declared in go.mod; oldstable and stable track the two
+        # releases upstream supports, so the matrix ages forward on its own.
+        go: ["1.24.x", "oldstable", "stable"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      # -shuffle=on because the arena carries state across calls within a test; a
+      # fixed order could hide an ordering assumption between tests. -race matters
+      # more than usual here: the package hands out unsafe views over its chunks.
+      - name: Test
+        run: go test -race -shuffle=on -count=1 ./...
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+      - name: Test with coverage
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+      - name: Report
+        run: go tool cover -func=coverage.out
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.1
+
+  tidy:
+    name: tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy -diff
+
+  benchmarks:
+    name: benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+      # One iteration each. This proves the benchmarks still build and run; it is
+      # not a measurement, since shared CI runners are far too noisy to gate on.
+      - name: Benchmarks build and run
+        run: go test -run='^$' -bench=. -benchtime=1x ./...

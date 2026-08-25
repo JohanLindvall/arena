@@ -1,0 +1,141 @@
+name: Release
+
+# Tagging waits for CI rather than racing it: this fires only when the CI run for a
+# main commit finishes green, and tags exactly the SHA that CI validated.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Serialize: two pushes landing together must not both read the same "latest tag".
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: tag and release
+    runs-on: ubuntu-latest
+    if: >-
+      github.repository == 'JohanLindvall/arena' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.workflow_run.conclusion == 'success')
+    env:
+      # workflow_run reports the commit CI ran on; a manual dispatch tags its own ref.
+      TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # Full history and tags: the version bump reads both.
+          fetch-depth: 0
+          filter: tree:0
+
+      - name: Decide the next version
+        id: version
+        run: |
+          set -euo pipefail
+
+          # Latest strict vMAJOR.MINOR.PATCH tag. Pre-release and other tags are
+          # ignored on purpose, so a hand-cut v1.2.0-rc1 cannot move the series.
+          latest="$(git tag --list 'v*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -n1 || true)"
+
+          if [ -z "$latest" ]; then
+            # First release: seed the series rather than bumping from nothing.
+            next="v0.1.0"
+            echo "no existing version tag; seeding at $next"
+          else
+            # Bump level comes from the commit messages new since that tag.
+            log="$(git log --format='%B' "${latest}..${TARGET_SHA}")"
+            if grep -qE '(^|[[:space:]])#major([[:space:]]|$)|^BREAKING[ -]CHANGE:' <<<"$log"; then
+              level=major
+            elif grep -qE '(^|[[:space:]])#minor([[:space:]]|$)' <<<"$log"; then
+              level=minor
+            else
+              level=patch
+            fi
+
+            IFS=. read -r major minor patch <<<"${latest#v}"
+            case "$level" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+            esac
+            next="v${major}.${minor}.${patch}"
+            echo "$latest + $level -> $next"
+          fi
+
+          # Reasons to do nothing, both of which are normal rather than failures.
+          skip=""
+          if git tag --points-at "$TARGET_SHA" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            skip="commit is already tagged"
+          elif grep -qiE '\[skip release\]|\[release skip\]' \
+              <<<"$(git log -1 --format='%B' "$TARGET_SHA")"; then
+            skip="commit message asks to skip the release"
+          elif git rev-parse -q --verify "refs/tags/${next}" >/dev/null; then
+            skip="${next} already exists"
+          fi
+
+          if [ -n "$skip" ]; then
+            echo "skipping: $skip"
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+            echo "### No release: $skip" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >>"$GITHUB_OUTPUT"
+            echo "version=${next}" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Push the tag
+        if: steps.version.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              tag -a "$VERSION" "$TARGET_SHA" -m "Release $VERSION"
+          git push origin "refs/tags/${VERSION}"
+
+      - name: Create the GitHub release
+        if: steps.version.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "$VERSION" --title "$VERSION" --generate-notes --verify-tag
+          {
+            echo "### Released [\`${VERSION}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${VERSION})"
+            echo "Tagged \`${TARGET_SHA}\`."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Ask the module proxy to fetch the new version
+        if: steps.version.outputs.skip == 'false'
+        continue-on-error: true
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -uo pipefail
+          # pkg.go.dev indexes what the proxy has seen, so one request publishes the
+          # new docs instead of waiting for a stranger to ask first. The proxy needs
+          # a moment to notice the tag, hence the retries; this is a nicety, and the
+          # step never fails the release.
+          module="$(sed -n 's/^module[[:space:]]\+//p' go.mod)"
+          escaped="$(sed 's/\([A-Z]\)/!\l\1/g' <<<"$module")"
+          url="https://proxy.golang.org/${escaped}/@v/${VERSION}.info"
+          for attempt in 1 2 3 4 5; do
+            if curl -fsS "$url"; then
+              echo "proxy has ${module}@${VERSION}"
+              exit 0
+            fi
+            echo "attempt ${attempt}: proxy has not seen the tag yet"
+            sleep 20
+          done
+          echo "proxy did not pick up the tag in time; pkg.go.dev will catch up on its own"

@@ -1,0 +1,64 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - nolintlint
+    - predeclared
+    - revive
+    - unconvert
+    - usestdlibvars
+  settings:
+    gocritic:
+      enabled-tags: [diagnostic, style, performance]
+      disabled-checks:
+        # len(s) == 0 is kept deliberately: the string paths read the same way as
+        # the []byte ones they delegate to, where len() is the only spelling.
+        - emptyStringTest
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: var-naming
+        - name: indent-error-flow
+        - name: error-strings
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - std-error-handling
+    rules:
+      # The package exists to hand out string and byte views over its own chunks
+      # without copying, so unsafe is the mechanism rather than an oversight. What
+      # makes it sound is documented on b2s, Append and Reset, and CI runs the
+      # suite under -race.
+      - path: arena\.go
+        linters: [gosec]
+        text: G103
+      # Ref narrows to int32 under the invariant documented on the type: offsets
+      # are bounded by the chunk size, the chunk index by the arena's total size.
+      - path: arena\.go
+        linters: [gosec]
+        text: G115
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/JohanLindvall/arena
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
