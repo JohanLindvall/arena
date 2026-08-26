@@ -24,6 +24,10 @@ import "unsafe"
 // interning short label strings is better served by the 64 KiB default.
 const defaultChunkBytes = 1 << 16
 
+// maxRefIndex is the largest offset or chunk index a Ref can hold, since it stores them as
+// int32. AppendRef checks against it rather than letting the conversion wrap.
+const maxRefIndex = 1<<31 - 1
+
 // elemSize is the width of one T in bytes.
 func elemSize[T any]() int { return int(unsafe.Sizeof(*new(T))) }
 
@@ -156,30 +160,19 @@ func (a *Arena[T]) Append(v []T) []T {
 //
 // Three int32s are what makes a Ref small, and they are also what bounds it. The bound is
 // 2^31-1 ELEMENTS rather than bytes, so it scales with the width of T: 2 GiB for an
-// Arena[byte], but 16 GiB for an Arena[int64]. Three things have to stay under it.
+// Arena[byte], but 16 GiB for an Arena[int64]. Two things can reach it — a single value
+// stored through AppendRef or StrRef, and an arena that New was given a chunk that wide.
+// A third, 2^31 chunks at once, is out of reach at any sane chunk size.
 //
-//   - Any single value stored through AppendRef or StrRef. An oversized value gets a chunk
-//     of its own and is addressed from 0 to its own length, so the value is the offset.
-//   - The chunk capacity, which New fixes at chunkBytes/sizeof(T) — reached by asking an
-//     Arena[byte] for a chunk budget past 2 GiB.
-//   - The number of chunks, which takes 2^31 of them. Out of reach at any sane chunk size,
-//     but not if one is set to a handful of elements.
-//
-// None of it is checked, and going past a bound wraps the conversion rather than failing.
-// What that does depends on where it lands:
-//
-//   - A length in [2^31, 2^32) makes end negative, so Empty calls the value ABSENT and
-//     Value returns nil. The value is simply gone, with nothing said.
-//   - A length at or past 2^32 wraps to a small positive number, so Value returns a
-//     truncated prefix of the value.
-//   - A wrapped offset or chunk index indexes out of range, so Value panics.
-//
-// Losing the value quietly is both the likeliest of the three and the hardest to notice,
-// which is the argument for staying clear of the bound rather than finding out empirically
-// where a particular value lands.
+// AppendRef panics rather than let the conversion wrap, so crossing the bound is loud. It
+// is worth knowing what the panic prevents: a length in [2^31, 2^32) wraps end negative,
+// which Empty would report as ABSENT and Value resolve to nil, losing the value with
+// nothing said; a length at or past 2^32 wraps to a small positive number, which Value
+// would resolve to a truncated prefix.
 //
 // Append and Intern carry no such limit. They hand back a slice or a string header, neither
-// of which holds an int32 — the bound belongs to the descriptor, not to the arena.
+// of which holds an int32 — the bound belongs to the descriptor, not to the arena — so they
+// are what to reach for when a value could approach it.
 type Ref[T any] struct {
 	chunk    int32
 	off, end int32
@@ -193,16 +186,31 @@ func (r Ref[T]) Empty() bool { return r.end <= r.off }
 // exactly as Append does, the chunk of its own an oversized value gets included; the two
 // differ only in what they hand back.
 //
-// v must be shorter than 2^31 elements, and nothing checks that it is. A longer value is
-// stored intact but comes back from Value as nil or as a truncated prefix, because the Ref
-// describing it cannot count that high — see the limits on [Ref] for the whole picture, and
-// use Append if a value could approach it.
+// It panics if the copy lands somewhere a Ref cannot describe — see the limits on [Ref].
+// That is a loud stand-in for what the int32 conversion would otherwise do quietly, which
+// is hand back a descriptor resolving to nothing or to the wrong bytes. Append has no such
+// limit and is the way to store a value that large.
+//
+// The check is after the copy, not before it, so a recovered panic leaves the value stored
+// but undescribed — wasted space in the current batch, which the next Reset reclaims, and
+// never a corrupt arena.
 func (a *Arena[T]) AppendRef(v []T) Ref[T] {
 	if len(v) == 0 {
 		return Ref[T]{}
 	}
 	i, off, _ := a.store(v)
-	return Ref[T]{chunk: int32(i), off: int32(off), end: int32(off + len(v))}
+	end := off + len(v)
+	// Only two things can reach here past the bound: a single value longer than 2^31-1
+	// elements, and an arena built with New over a chunk that wide. The uniform path
+	// cannot, because store only puts a value in a chunk with room for it, which caps end
+	// at the chunk's own capacity.
+	if end > maxRefIndex {
+		panic("arena: value too large for a Ref to describe (limit 2^31-1 elements); Append has no such limit")
+	}
+	if i > maxRefIndex {
+		panic("arena: too many chunks for a Ref to describe (limit 2^31-1)")
+	}
+	return Ref[T]{chunk: int32(i), off: int32(off), end: int32(end)}
 }
 
 // Value resolves r against the arena, or nil for the absent descriptor.

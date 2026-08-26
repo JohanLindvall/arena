@@ -50,7 +50,12 @@ golangci-lint run                   # v2, version pinned in .github/workflows/ci
 go test -run='^$' -bench=. -benchtime=1x ./...
 ```
 
-Coverage is at 100% of statements and worth keeping there — `go test -cover`.
+Coverage sits at 98.5% of statements, and the shortfall is exactly one line:
+the `too many chunks` panic in `AppendRef`, which needs 2^31 chunks to reach —
+51 GB of slice headers before any data. Keep it anyway; without it a chunk index
+past 2^32 wraps small-positive and `Value` silently reads the wrong chunk. Every
+other statement is covered, so treat a drop below that as a real gap rather than
+noise.
 
 `.golangci.yml` carries two deliberate gosec exclusions, G103 (unsafe) and G115
 (the int32 narrowing in `AppendRef`). Both name a **file path**, so moving code
@@ -71,9 +76,12 @@ stripped and confirming the findings are the ones the rules claim to cover.
   nothing to catch it — a test asserts the resulting `Retained` figures.
 - **`Ref` stays 12 bytes and pointer-free.** That is its entire reason to exist
   over the `[]T` from `Append`; a test asserts `unsafe.Sizeof`.
-- **`Ref` addresses at most 2³¹−1 elements.** Nothing checks it, and past the
-  bound a value goes silently absent, silently truncated, or panics.
-  `Test_unit_Ref_SizeLimits` pins all three.
+- **`Ref` addresses at most 2³¹−1 elements**, and `AppendRef` panics rather than
+  let the conversion wrap. The guard is free *because* the uniform store path
+  already caps `end` at the chunk's capacity — only an oversized value or an
+  over-wide chunk can reach the bound — so do not move or "optimise" it without
+  re-deriving that. `Test_unit_Ref_SizeLimits` pins the guard, the over-wide
+  chunk case, and the fact that `Append` stays unbounded.
 
 ## Benchmarking honestly
 

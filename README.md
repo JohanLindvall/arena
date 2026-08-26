@@ -111,32 +111,23 @@ input, `Empty` reports it, `Value` resolves it to `nil` and `Str` to `""`.
 
 Three `int32`s are what make a `Ref` small, and also what bound it. The bound is
 2³¹−1 **elements**, not bytes, so it scales with the width of `T` — 2 GiB for an
-`Arena[byte]`, 16 GiB for an `Arena[int64]`. Three things must stay under it:
+`Arena[byte]`, 16 GiB for an `Arena[int64]`. Two things can reach it: a single
+value stored through `AppendRef`/`StrRef`, and an arena `New` was given a chunk
+that wide. A third, 2³¹ chunks at once, is out of reach at any sane chunk size.
 
-- **Any single value** stored through `AppendRef` or `StrRef`. An oversized
-  value gets a chunk of its own and is addressed from 0 to its own length, so
-  the value *is* the offset.
-- **The chunk capacity**, which `New` fixes at `chunkBytes/sizeof(T)` — reached
-  by asking an `Arena[byte]` for a chunk budget past 2 GiB.
-- **The number of chunks**, which takes 2³¹ of them. Out of reach at any sane
-  chunk size, but not if one is set to a handful of elements.
+**`AppendRef` panics rather than let the conversion wrap**, so crossing the bound
+is loud. The check measures free: the uniform store path already caps the offset
+at the chunk's own capacity, so only an oversized value or an over-wide chunk can
+get near it, and the branch is never taken in ordinary use.
 
-None of it is checked, and crossing a bound wraps the conversion rather than
-failing:
-
-| Length | `int32` becomes | What `Value` does |
-| --- | --- | --- |
-| under 2³¹ | itself | resolves correctly |
-| 2³¹ to 2³²−1 | negative | returns `nil` — `Empty` now reports the value **absent** |
-| 2³² and up | a small positive | returns a **truncated prefix** |
-| (wrapped offset or chunk index) | out of range | **panics** |
-
-Losing the value quietly is both the likeliest of these and the hardest to
-notice, so stay clear of the bound rather than establish empirically where a
-given value lands.
+It is worth naming what the panic stands in for. Unguarded, a length between 2³¹
+and 2³² wraps `end` negative, so `Empty` reports the value **absent** and `Value`
+returns `nil` — the value is gone with nothing said. Past 2³² it wraps to a small
+positive number and `Value` returns a **truncated prefix**.
 
 `Append` and `Intern` carry no such limit — a slice or string header holds no
-`int32`. The bound belongs to the descriptor, not to the arena.
+`int32`. The bound belongs to the descriptor, not to the arena, so they are what
+to reach for when a value could approach it.
 
 ## Rewinding
 

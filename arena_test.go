@@ -378,10 +378,10 @@ func Test_unit_Arena_ResetDropsOversizedChunks(t *testing.T) {
 	assert.Equal(t, uniform, a.Retained(), "the next batch must refill the chunks Reset kept")
 }
 
-// Test_unit_Ref_SizeLimits pins the bound documented on Ref, and the three different ways
-// crossing it goes wrong. It uses a zero-width element type on purpose: the wrap is on the
-// int32 conversion of an element COUNT, so it is the same wherever T is wide or narrow, and
-// struct{} lets a slice of 2^31 elements cost nothing at all to build.
+// Test_unit_Ref_SizeLimits pins the bound documented on Ref and the guard that enforces
+// it. It uses a zero-width element type on purpose: the overflow is on the int32
+// conversion of an element COUNT, so it behaves the same however wide T is, and struct{}
+// makes a slice of 2^31 elements free to build.
 func Test_unit_Ref_SizeLimits(t *testing.T) {
 	if strconv.IntSize < 64 {
 		t.Skip("expressing a length past 2^31 needs a 64-bit int")
@@ -391,30 +391,41 @@ func Test_unit_Ref_SizeLimits(t *testing.T) {
 	limit := int(math.MaxInt32)
 	limit++ // 2^31, the first length a Ref cannot describe
 
+	const tooLarge = "arena: value too large for a Ref to describe (limit 2^31-1 elements); Append has no such limit"
+
 	a := New[struct{}](1 << 12)
 	require.Zero(t, a.Retained(), "zero-width elements must cost no memory")
 
-	// Just under the bound is the largest value a Ref still describes correctly.
+	// Just under the bound is the largest value a Ref still describes.
 	ok := a.AppendRef(make([]struct{}, limit-1))
 	assert.False(t, ok.Empty(), "2^31-1 elements is still describable")
 	assert.Len(t, a.Value(ok), limit-1, "and must resolve to its whole length")
 
-	// At 2^31 the end offset wraps negative, so the value reads back as ABSENT. This is
-	// the quiet failure the doc warns about: the bytes are stored, the descriptor is not.
-	lost := a.AppendRef(make([]struct{}, limit))
-	assert.True(t, lost.Empty(), "2^31 elements wraps end negative, so the Ref reads absent")
-	assert.Nil(t, a.Value(lost), "and the value is silently gone")
+	// At and past the bound AppendRef panics rather than wrap. Unguarded, 2^31 would have
+	// wrapped end negative and read back ABSENT, and 2^32+5 would have read back as a
+	// 5-element prefix: silent loss and silent truncation, which is what the panic is
+	// standing in for.
+	for _, n := range []int{limit, 2*limit + 5} {
+		assert.PanicsWithValue(t, tooLarge,
+			func() { a.AppendRef(make([]struct{}, n)) },
+			"AppendRef must refuse a value of %d elements", n)
+	}
 
-	// At or past 2^32 the wrap lands on a small positive number instead, so the value
-	// comes back truncated rather than missing.
-	truncated := a.AppendRef(make([]struct{}, 2*limit+5))
-	assert.False(t, truncated.Empty())
-	assert.Len(t, a.Value(truncated), 5, "2^32+5 elements wraps to a 5-element prefix")
+	// The other route to the bound is a chunk wider than a Ref can index, where even a
+	// value that fits one overflows the offset. It is the same guard.
+	wide := New[struct{}](limit + 10)
+	assert.PanicsWithValue(t, tooLarge,
+		func() { wide.AppendRef(make([]struct{}, limit)) },
+		"a chunk wider than 2^31-1 elements must be caught as well")
 
-	// Append is not bounded this way: a slice header holds no int32, so the same lengths
-	// round-trip whole.
+	// Append is not bounded this way: a slice header holds no int32, so lengths that
+	// AppendRef refuses round-trip whole.
 	assert.Len(t, a.Append(make([]struct{}, limit)), limit, "Append carries no int32 bound")
+	assert.Len(t, a.Append(make([]struct{}, 2*limit+5)), 2*limit+5)
 
-	// Size counts what was stored regardless, in bytes — zero here, since T is zero-width.
+	// A refused value is still stored, so the arena stays consistent for anything that
+	// recovers — and Reset reclaims the space either way.
+	a.Reset()
 	assert.Zero(t, a.Size())
+	assert.Zero(t, a.Retained())
 }
