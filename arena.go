@@ -152,9 +152,34 @@ func (a *Arena[T]) Append(v []T) []T {
 // The zero Ref is the ABSENT value: a stored value is never zero elements long (AppendRef
 // returns the zero Ref for empty input), so end <= off cannot name a real one.
 //
-// int32 bounds both fields well below 2^31 — the chunk index by the arena's total size, the
-// offsets by the chunk size, except in an oversized chunk where they are bounded by the
-// single value that made it.
+// # Limits
+//
+// Three int32s are what makes a Ref small, and they are also what bounds it. The bound is
+// 2^31-1 ELEMENTS rather than bytes, so it scales with the width of T: 2 GiB for an
+// Arena[byte], but 16 GiB for an Arena[int64]. Three things have to stay under it.
+//
+//   - Any single value stored through AppendRef or StrRef. An oversized value gets a chunk
+//     of its own and is addressed from 0 to its own length, so the value is the offset.
+//   - The chunk capacity, which New fixes at chunkBytes/sizeof(T) — reached by asking an
+//     Arena[byte] for a chunk budget past 2 GiB.
+//   - The number of chunks, which takes 2^31 of them. Out of reach at any sane chunk size,
+//     but not if one is set to a handful of elements.
+//
+// None of it is checked, and going past a bound wraps the conversion rather than failing.
+// What that does depends on where it lands:
+//
+//   - A length in [2^31, 2^32) makes end negative, so Empty calls the value ABSENT and
+//     Value returns nil. The value is simply gone, with nothing said.
+//   - A length at or past 2^32 wraps to a small positive number, so Value returns a
+//     truncated prefix of the value.
+//   - A wrapped offset or chunk index indexes out of range, so Value panics.
+//
+// Losing the value quietly is both the likeliest of the three and the hardest to notice,
+// which is the argument for staying clear of the bound rather than finding out empirically
+// where a particular value lands.
+//
+// Append and Intern carry no such limit. They hand back a slice or a string header, neither
+// of which holds an int32 — the bound belongs to the descriptor, not to the arena.
 type Ref[T any] struct {
 	chunk    int32
 	off, end int32
@@ -167,6 +192,11 @@ func (r Ref[T]) Empty() bool { return r.end <= r.off }
 // caller that keeps many descriptors and does not want them scanned (see [Ref]). It stores
 // exactly as Append does, the chunk of its own an oversized value gets included; the two
 // differ only in what they hand back.
+//
+// v must be shorter than 2^31 elements, and nothing checks that it is. A longer value is
+// stored intact but comes back from Value as nil or as a truncated prefix, because the Ref
+// describing it cannot count that high — see the limits on [Ref] for the whole picture, and
+// use Append if a value could approach it.
 func (a *Arena[T]) AppendRef(v []T) Ref[T] {
 	if len(v) == 0 {
 		return Ref[T]{}

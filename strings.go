@@ -52,6 +52,9 @@ func (a *StringArena) Intern(s string) string {
 // retains enough strings for the descriptors themselves to matter (see [Ref]).
 //
 // The empty string gives the zero Ref, which Str resolves back to "".
+//
+// s must be shorter than 2 GiB, the bound a [Ref] can describe, and nothing checks that it
+// is — a longer string comes back from Str as "" or truncated. Intern has no such limit.
 func (a *StringArena) StrRef(s string) Ref[byte] {
 	if len(s) == 0 {
 		return Ref[byte]{}

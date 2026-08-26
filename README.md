@@ -107,6 +107,37 @@ cannot be resolved against an arena of some other element type.
 The zero `Ref` is the absent value: `AppendRef` and `StrRef` return it for empty
 input, `Empty` reports it, `Value` resolves it to `nil` and `Str` to `""`.
 
+### What a `Ref` can address
+
+Three `int32`s are what make a `Ref` small, and also what bound it. The bound is
+2³¹−1 **elements**, not bytes, so it scales with the width of `T` — 2 GiB for an
+`Arena[byte]`, 16 GiB for an `Arena[int64]`. Three things must stay under it:
+
+- **Any single value** stored through `AppendRef` or `StrRef`. An oversized
+  value gets a chunk of its own and is addressed from 0 to its own length, so
+  the value *is* the offset.
+- **The chunk capacity**, which `New` fixes at `chunkBytes/sizeof(T)` — reached
+  by asking an `Arena[byte]` for a chunk budget past 2 GiB.
+- **The number of chunks**, which takes 2³¹ of them. Out of reach at any sane
+  chunk size, but not if one is set to a handful of elements.
+
+None of it is checked, and crossing a bound wraps the conversion rather than
+failing:
+
+| Length | `int32` becomes | What `Value` does |
+| --- | --- | --- |
+| under 2³¹ | itself | resolves correctly |
+| 2³¹ to 2³²−1 | negative | returns `nil` — `Empty` now reports the value **absent** |
+| 2³² and up | a small positive | returns a **truncated prefix** |
+| (wrapped offset or chunk index) | out of range | **panics** |
+
+Losing the value quietly is both the likeliest of these and the hardest to
+notice, so stay clear of the bound rather than establish empirically where a
+given value lands.
+
+`Append` and `Intern` carry no such limit — a slice or string header holds no
+`int32`. The bound belongs to the descriptor, not to the arena.
+
 ## Rewinding
 
 | Call | Bytes | Uniform chunks | Oversized chunks |

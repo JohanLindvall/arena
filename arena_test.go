@@ -2,6 +2,8 @@ package arena
 
 import (
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 	"unsafe"
@@ -374,4 +376,45 @@ func Test_unit_Arena_ResetDropsOversizedChunks(t *testing.T) {
 		a.Append([]byte("y"))
 	}
 	assert.Equal(t, uniform, a.Retained(), "the next batch must refill the chunks Reset kept")
+}
+
+// Test_unit_Ref_SizeLimits pins the bound documented on Ref, and the three different ways
+// crossing it goes wrong. It uses a zero-width element type on purpose: the wrap is on the
+// int32 conversion of an element COUNT, so it is the same wherever T is wide or narrow, and
+// struct{} lets a slice of 2^31 elements cost nothing at all to build.
+func Test_unit_Ref_SizeLimits(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("expressing a length past 2^31 needs a 64-bit int")
+	}
+	// Built by increment rather than as a constant, so this still compiles for a 32-bit
+	// target, where the skip above is what keeps it from running.
+	limit := int(math.MaxInt32)
+	limit++ // 2^31, the first length a Ref cannot describe
+
+	a := New[struct{}](1 << 12)
+	require.Zero(t, a.Retained(), "zero-width elements must cost no memory")
+
+	// Just under the bound is the largest value a Ref still describes correctly.
+	ok := a.AppendRef(make([]struct{}, limit-1))
+	assert.False(t, ok.Empty(), "2^31-1 elements is still describable")
+	assert.Len(t, a.Value(ok), limit-1, "and must resolve to its whole length")
+
+	// At 2^31 the end offset wraps negative, so the value reads back as ABSENT. This is
+	// the quiet failure the doc warns about: the bytes are stored, the descriptor is not.
+	lost := a.AppendRef(make([]struct{}, limit))
+	assert.True(t, lost.Empty(), "2^31 elements wraps end negative, so the Ref reads absent")
+	assert.Nil(t, a.Value(lost), "and the value is silently gone")
+
+	// At or past 2^32 the wrap lands on a small positive number instead, so the value
+	// comes back truncated rather than missing.
+	truncated := a.AppendRef(make([]struct{}, 2*limit+5))
+	assert.False(t, truncated.Empty())
+	assert.Len(t, a.Value(truncated), 5, "2^32+5 elements wraps to a 5-element prefix")
+
+	// Append is not bounded this way: a slice header holds no int32, so the same lengths
+	// round-trip whole.
+	assert.Len(t, a.Append(make([]struct{}, limit)), limit, "Append carries no int32 bound")
+
+	// Size counts what was stored regardless, in bytes — zero here, since T is zero-width.
+	assert.Zero(t, a.Size())
 }
