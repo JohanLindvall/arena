@@ -131,21 +131,27 @@ func Test_unit_Arena_AppendValuesStayContiguous(t *testing.T) {
 	assert.Equal(t, total, a.Size(), "an empty append must not move Size")
 }
 
-// Test_unit_Arena_OversizedValueIsStandalone: a value larger than a chunk gets its own copy
-// rather than an oversized chunk, so the reusable chunks stay a uniform size and one huge
-// value cannot pin memory for the arena's lifetime. Retained counts only the uniform chunks,
-// which is what makes it exact for a trim policy.
-func Test_unit_Arena_OversizedValueIsStandalone(t *testing.T) {
+// Test_unit_Arena_OversizedValueGetsItsOwnChunk: a value larger than a chunk is still
+// arena-backed, in a chunk sized to fit it exactly. What stops that pinning memory is
+// Reset, which drops such a chunk rather than recycling it — so what carries over to the
+// next batch is uniform however lumpy the batch that just ran was.
+func Test_unit_Arena_OversizedValueGetsItsOwnChunk(t *testing.T) {
 	a := New[byte](defaultChunkBytes)
 	a.Append([]byte(`1`))
 	huge := []byte(`"` + strings.Repeat("z", 2*defaultChunkBytes) + `"`)
-	ref := a.Append(huge)
+	view := a.Append(huge)
 
-	assert.Equal(t, string(huge), string(ref), "an oversized value must still read back whole")
-	assert.Equal(t, defaultChunkBytes, a.Retained(), "the oversized value must not become a retained chunk")
+	assert.Equal(t, string(huge), string(view), "an oversized value must still read back whole")
+	assert.Equal(t, defaultChunkBytes+len(huge), a.Retained(),
+		"the oversized value must get a chunk of its own, sized to fit it exactly")
 
-	// It still counts as stored bytes, because callers bound a payload with Size.
+	// It counts as stored bytes either way, because callers bound a payload with Size.
 	assert.Equal(t, 1+len(huge), a.Size())
+
+	// The uniform chunk is rewound and kept; the oversized one is dropped outright.
+	a.Reset()
+	assert.Zero(t, a.Size())
+	assert.Equal(t, defaultChunkBytes, a.Retained(), "Reset must not recycle the oversized chunk")
 }
 
 // Test_unit_Arena_ReleaseDropsChunksResetKeepsThem pins the difference between the two
@@ -186,10 +192,16 @@ func Test_unit_Arena_Retained(t *testing.T) {
 	if got := a.Retained(); got != two {
 		t.Fatalf("Reset changed retained from %d to %d", two, got)
 	}
-	// Oversized strings are standalone clones, not chunks: retained is unchanged.
-	a.Intern(string(make([]byte, defaultChunkBytes+1)))
+	// An oversized string is a chunk of its own, so it counts while it is in flight — and
+	// stops counting at the Reset that drops it rather than recycling it.
+	oversize := defaultChunkBytes + 1
+	a.Intern(string(make([]byte, oversize)))
+	if got := a.Retained(); got != two+oversize {
+		t.Fatalf("oversized intern: retained %d, want %d", got, two+oversize)
+	}
+	a.Reset()
 	if got := a.Retained(); got != two {
-		t.Fatalf("oversized intern changed retained from %d to %d", two, got)
+		t.Fatalf("Reset recycled the oversized chunk: retained %d, want %d", got, two)
 	}
 }
 
@@ -224,8 +236,7 @@ func Test_unit_Arena_RefIsPointerFreeAndResolves(t *testing.T) {
 	assert.True(t, a.AppendRef(nil).Empty(), "an empty append is the absent value")
 	assert.False(t, refs[0].Empty())
 
-	// Release frees the oversized chunk too, which is what makes it safe for a per-batch
-	// caller: Reset alone would keep it, since it is not a uniform chunk.
+	// Release drops everything, the uniform chunks included — those a Reset would keep.
 	a.Release()
 	assert.Zero(t, a.Retained())
 }
@@ -313,8 +324,7 @@ func Test_unit_StringArena_StrRefAndStr(t *testing.T) {
 	for i := range 200 {
 		add(fmt.Sprintf("label-%d-%s", i, strings.Repeat("y", 100)))
 	}
-	// Unlike Intern, an oversized string is chunk-backed, because a Ref can only address
-	// chunk storage — which is what makes it resolvable at all.
+	// An oversized string is chunk-backed like any other, so a Ref addresses it fine.
 	add(strings.Repeat("z", 3*chunk))
 	add("")
 
@@ -331,4 +341,37 @@ func Test_unit_StringArena_StrRefAndStr(t *testing.T) {
 	// StrRef hands out the same descriptor AppendRef does, so the two sides interoperate.
 	assert.Equal(t, "raw", a.Str(a.AppendRef([]byte("raw"))))
 	assert.Equal(t, []byte("via StrRef"), a.Value(a.StrRef("via StrRef")))
+}
+
+// Test_unit_Arena_ResetDropsOversizedChunks is the boundary between the two rewinds. A
+// batch that stored values no chunk could hold must hand exactly their memory back at
+// Reset while keeping the uniform chunks it is about to refill, so a lumpy batch cannot
+// ratchet the arena's footprint up for good.
+func Test_unit_Arena_ResetDropsOversizedChunks(t *testing.T) {
+	const chunk = 1 << 12
+	a := New[byte](chunk)
+
+	for range 3 * chunk {
+		a.Append([]byte("x"))
+	}
+	uniform := a.Retained()
+	require.Equal(t, 3*chunk, uniform, "the small values must fill whole uniform chunks")
+
+	// Both entry points take the same path, so both leave a chunk sized to the value.
+	huge := make([]byte, 5*chunk)
+	for range 4 {
+		a.AppendRef(huge)
+		a.Append(huge)
+	}
+	assert.Equal(t, uniform+8*len(huge), a.Retained(),
+		"Append and AppendRef must both give an oversized value a chunk sized to fit")
+
+	a.Reset()
+	assert.Equal(t, uniform, a.Retained(), "Reset keeps the uniform chunks and drops the rest")
+
+	// And the arena is immediately reusable, refilling what it kept rather than growing.
+	for range 3 * chunk {
+		a.Append([]byte("y"))
+	}
+	assert.Equal(t, uniform, a.Retained(), "the next batch must refill the chunks Reset kept")
 }

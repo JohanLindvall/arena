@@ -1,9 +1,6 @@
 package arena
 
-import (
-	"strings"
-	"unsafe"
-)
+import "unsafe"
 
 // StringArena is an Arena[byte] with the string entry points added. It exists because a
 // method cannot narrow its receiver's type parameter, so entry points that are only
@@ -40,16 +37,12 @@ func s2b(s string) []byte {
 	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
-// Intern copies s into the arena and returns a stable string view over the copy.
-// Strings larger than a chunk are not arena-backed: they get a standalone copy so
-// the arena's reusable chunks stay a uniform size and a single huge string cannot
-// pin an oversized chunk for the arena's lifetime.
+// Intern copies s into the arena and returns a stable string view over the copy. A string
+// larger than a whole chunk gets a chunk of its own, which Reset drops rather than
+// recycling — see [Arena.Append].
 func (a *StringArena) Intern(s string) string {
 	if len(s) == 0 {
 		return ""
-	}
-	if len(s) > a.chunkLen() {
-		return strings.Clone(s) // a standalone copy, already immutable: no b2s aliasing concern
 	}
 	return b2s(a.Append(s2b(s)))
 }
@@ -57,10 +50,6 @@ func (a *StringArena) Intern(s string) string {
 // StrRef copies s into the arena and returns a pointer-free descriptor for the copy — the
 // string counterpart of AppendRef, resolved by Str. Reach for it over Intern when the batch
 // retains enough strings for the descriptors themselves to matter (see [Ref]).
-//
-// Unlike Intern, an oversized string goes into a chunk of its own rather than a standalone
-// copy, because a Ref can only address chunk storage. That chunk is NOT uniform, so it is
-// kept by Reset and only freed by Release.
 //
 // The empty string gives the zero Ref, which Str resolves back to "".
 func (a *StringArena) StrRef(s string) Ref[byte] {

@@ -65,7 +65,8 @@ Every entry point copies, and differs only in what you get back.
 
 `Value` resolves a `Ref[T]` back to a `[]T`; `Str` resolves one back to a
 `string`. They are the same descriptor, so the byte and string sides
-interoperate freely.
+interoperate freely. All four store through one path, so they agree on
+everything except what they hand back.
 
 Every view is **one contiguous slice**. A value that does not fit the current
 chunk starts a new chunk rather than being split, so nothing has to be
@@ -108,10 +109,10 @@ input, `Empty` reports it, `Value` resolves it to `nil` and `Str` to `""`.
 
 ## Rewinding
 
-| Call | Bytes | Chunks |
-| --- | --- | --- |
-| `Reset()` | dropped | **kept**, ready to be refilled |
-| `Release()` | dropped | **freed** |
+| Call | Bytes | Uniform chunks | Oversized chunks |
+| --- | --- | --- | --- |
+| `Reset()` | dropped | **kept**, ready to be refilled | **freed** |
+| `Release()` | dropped | **freed** | **freed** |
 
 `Reset` is for an owner about to run the next batch: re-allocating the chunks
 would be the largest allocation it makes, so it does not. `Release` is for an
@@ -121,8 +122,10 @@ which should retain its per-value bookkeeping and none of the values.
 Two counters describe the arena, both in bytes whatever `T` is. `Size` is the
 bytes stored since the last rewind, which is what you check against a payload
 budget; `Retained` is the chunk capacity holding them, which is the actual
-footprint. A burst grows the chunk list and `Reset` never shrinks it, so
-`Retained` is the number a trim policy should watch.
+footprint. A burst grows the chunk list and `Reset` never shrinks the uniform
+part of it, so `Retained` is the number a trim policy should watch. Mid-batch it
+counts any oversized chunks in flight; between batches it is the uniform
+capacity that carried over.
 
 ## Sizing the chunk
 
@@ -136,12 +139,13 @@ starts a new one and strands the remainder, so size the chunk to the values.
 Interning short strings is comfortable at the default; accumulating large rows
 or blocks wants something closer to 1 MiB.
 
-Values larger than a whole chunk are handled but win nothing. `Append` and
-`Intern` give them a standalone copy that dies with the batch, keeping the
-reusable chunks a uniform size so one huge value cannot pin an oversized chunk
-for the arena's lifetime. `AppendRef` and `StrRef` cannot do that — a `Ref` can
-only address chunk storage — so they give the value a chunk of its own, which is
-*not* uniform and survives `Reset`. Only `Release` frees it.
+A value larger than a whole chunk gets a chunk of its own, sized to fit it
+exactly. All four entry points do the same thing with one, so an oversized value
+is `Ref`-addressable like any other. `Reset` **drops** those chunks instead of
+recycling them — one was made to fit a single large value and is the wrong shape
+for anything else, so keeping it would leave that value's memory in the reusable
+set for as long as the arena lives. What survives a `Reset` is uniform, however
+lumpy the batch that just ran was.
 
 ## The rules
 
@@ -173,9 +177,9 @@ stack-allocated and proves nothing:
 
 | Value | `StringArena.Intern` | One heap copy per value |
 | --- | --- | --- |
-| 16 B | 7.0 ns/op, 0 allocs | 15.1 ns/op, 1 alloc |
-| 256 B | 9.6 ns/op, 0 allocs | 65.7 ns/op, 1 alloc |
-| 4 KiB | 181 ns/op, 0 allocs | 675 ns/op, 1 alloc |
+| 16 B | 6.6 ns/op, 0 allocs | 15.5 ns/op, 1 alloc |
+| 256 B | 8.9 ns/op, 0 allocs | 60.1 ns/op, 1 alloc |
+| 4 KiB | 152 ns/op, 0 allocs | 647 ns/op, 1 alloc |
 
 At 4 KiB a batch no longer fits the chunks, so that row is dominated by chunk
 allocation and moves by tens of percent between runs; the two smaller ones are
@@ -187,9 +191,9 @@ only the descriptor slice differs:
 
 | Descriptors retained | Width | GC cycle |
 | --- | --- | --- |
-| `[]Ref[byte]` | 12 B, noscan | **269 µs** |
-| `[][]byte` | 24 B, scanned | 2292 µs |
-| `[]string` | 16 B, scanned | 2410 µs |
+| `[]Ref[byte]` | 12 B, noscan | **254 µs** |
+| `[][]byte` | 24 B, scanned | 2081 µs |
+| `[]string` | 16 B, scanned | 2393 µs |
 
 The element type costs nothing. Storing 256 bytes per call through arenas of
 different `T`, where the struct case also carries a pointer and so has scanned
@@ -197,9 +201,9 @@ chunks:
 
 | Element type | Store |
 | --- | --- |
-| `byte` | 8.6 ns/op, 0 allocs |
+| `byte` | 9.0 ns/op, 0 allocs |
 | `int64` | 8.8 ns/op, 0 allocs |
-| `struct{int64; float64; string}` | 9.2 ns/op, 0 allocs |
+| `struct{int64; float64; string}` | 10.1 ns/op, 0 allocs |
 
 ## Documentation
 

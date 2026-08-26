@@ -50,18 +50,21 @@ func BenchmarkIntern(b *testing.B) {
 }
 
 // BenchmarkAppend covers the byte primitive across sizes, including the oversized path
-// where a value larger than a chunk falls back to a standalone copy and the arena buys
-// nothing at all.
+// where a value larger than a chunk gets a chunk of its own.
 func BenchmarkAppend(b *testing.B) {
 	for _, size := range []int{16, 256, 4096, defaultChunkBytes + 1} {
 		value := make([]byte, size)
+		// An oversized value holds a chunk of its own until Reset, so bound the bytes
+		// live between rewinds rather than always holding `batch` of them: at 64 KiB
+		// apiece, 4096 would be a quarter of a gigabyte.
+		live := min(batch, max(1, (16<<20)/size))
 
 		b.Run(fmt.Sprintf("%d", size), func(b *testing.B) {
 			a := New[byte](defaultChunkBytes)
 			b.ReportAllocs()
 			n := 0
 			for b.Loop() {
-				if n == batch {
+				if n == live {
 					a.Reset()
 					n = 0
 				}
