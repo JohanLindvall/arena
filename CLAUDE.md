@@ -50,7 +50,7 @@ golangci-lint run                   # v2, version pinned in .github/workflows/ci
 go test -run='^$' -bench=. -benchtime=1x ./...
 ```
 
-Coverage sits at 98.5% of statements, and the shortfall is exactly one line:
+Coverage sits at 98.9% of statements, and the shortfall is exactly one line:
 the `too many chunks` panic in `AppendRef`, which needs 2^31 chunks to reach —
 51 GB of slice headers before any data. Keep it anyway; without it a chunk index
 past 2^32 wraps small-positive and `Value` silently reads the wrong chunk. Every
@@ -69,11 +69,49 @@ stripped and confirming the findings are the ones the rules claim to cover.
 - **A chunk is never reallocated once a view points into it.** Views alias chunk
   storage directly, so growing a chunk in place would corrupt live data rather
   than error. A value that does not fit starts a new chunk.
-- **An oversized chunk marks itself by its capacity.** `store` builds uniform
+- **An oversized chunk marks itself by its capacity.** `place` builds uniform
   chunks at exactly `chunkLen` and oversized ones at exactly the value's length,
   which is the whole basis for `isOversized`, which is what lets `Reset` drop
   them. Change how either kind is allocated and that equivalence breaks with
-  nothing to catch it — a test asserts the resulting `Retained` figures.
+  nothing to catch it — tests assert the resulting `Retained` figures for both
+  the copying path and `Reserve`.
+- **`place` is the only placement policy, and the entry points are thin over
+  it.** `Append`, `AppendRef` (and so `Intern`, `StrRef`) pass their value;
+  `Reserve` passes nil and a count. Which chunk a value lands in is decided
+  there and nowhere else — that is what keeps the copying and non-copying sides
+  from drifting into two sets of rules. `place` hands each caller the region
+  already in the shape it wants, which is not tidiness but budget: see below.
+- **`Reserve` returns capacity exactly `n`, via a three-index slice.** Not the
+  rest of the chunk: the exact cap is what makes overfilling reallocate instead
+  of writing over the neighbouring value, so it is load-bearing rather than
+  tidiness. `Test_unit_Arena_ReserveShape` asserts the cap and then overfills to
+  prove it. Note `Append`'s view is NOT capped this way — it carries the chunk's
+  slack, so appending to one corrupts the arena; that is what rule 3 ("never
+  mutate what you were handed") covers, and it is why `Reserve` exists for
+  callers who mean to fill a region themselves.
+
+## Two compiler thresholds this package sits right on top of
+
+Both were found the same way — a refactor that changed no logic at all and cost
+20-27% — so check them after touching `place` or the entry points, with
+`go build -gcflags=-m=2` and an interleaved A/B.
+
+- **A `make` immediately followed by a `copy` that fills it skips the zeroing,
+  and only when the two sit together.** Moving the copy to the caller cost
+  `Append/65537` **+27%** — a whole extra pass over the value — and an isolated
+  micro reproduces it exactly (3.40 → 4.33 µs on a 64 KiB make+copy). This is
+  why `place` takes the source rather than returning a region for the caller to
+  fill, and why its oversized branch writes `make([]T, len(src))` next to
+  `copy(big, src)` with the length spelled the same way in both. `Reserve`'s arm
+  of that branch deliberately keeps the zeroing: it has nothing to copy, and a
+  zeroed region is what its doc promises for a chunk not yet reused.
+- **`Append` inlines at cost 80 against a budget of 80, and `Reserve` at 79** —
+  in the `go.shape` instantiation, which is the one that runs; the monomorphised
+  `Arena[uint8]` figures are far lower and will mislead you. Base `Append` was
+  79, and one extra argument took it to 81 and stopped it inlining, worth
+  **+15%** on `Append/16`. That is the whole reason `place` shapes the returned
+  region instead of the callers doing it: `place` costs 213 and never inlines,
+  so work moved into it is free and work moved out of it is not.
 - **`Ref` stays 12 bytes and pointer-free.** That is its entire reason to exist
   over the `[]T` from `Append`; a test asserts `unsafe.Sizeof`.
 - **`Ref` addresses at most 2³¹−1 elements**, and `AppendRef` panics rather than

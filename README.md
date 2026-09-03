@@ -50,11 +50,13 @@ receiver's type parameter, so `Intern` cannot live on `Arena` itself. Everything
 ```go
 a := arena.New[Sample](1 << 20)   // 1 MiB chunks of Sample
 s := arena.NewStringArena(4096)   // 4 KiB chunks, plus Intern/StrRef/Str
+f := arena.Make[float64](4096)    // the same, as a value rather than a pointer
 ```
 
 ## Storing a value
 
-Every entry point copies, and differs only in what you get back.
+These four copy the value in, and differ only in what you get back. (`Reserve`,
+below, is the one entry point that does not copy.)
 
 | Call | Returns | Use it when |
 | --- | --- | --- |
@@ -75,6 +77,34 @@ reassembled on the way out.
 Views stay valid until the next `Reset` or `Release`. Chunks are never
 reallocated once allocated, so storing more values never invalidates a view
 handed out earlier.
+
+### Building a value in place
+
+`Reserve(n)` is `Append` without the copy: it hands back a `[]T` of length 0 and
+capacity **exactly** `n`, backed by the arena, for a value you are building
+rather than one you already hold. A decoder that learns an array's length before
+its elements reserves the backing once and appends into it, paying neither a
+per-value allocation nor a copy out of a scratch buffer.
+
+```go
+p := a.Reserve(len(row))          // len 0, cap exactly len(row)
+for _, v := range row {
+    p = append(p, v)              // fills the arena's own storage
+}
+```
+
+The capacity is exactly `n` rather than the rest of the chunk, so overfilling
+reallocates to the heap the way any other full slice does and can never write
+over the neighbour. Everything else matches `Append`: the region is yours alone,
+it stays valid until `Reset` or `Release`, and a reservation too large for a
+chunk gets a chunk of its own. `Reserve` and the copying entry points share one
+placement step and mix freely on one arena.
+
+`Reserve` **does not clear** what it hands back — a caller about to fill the
+region would pay for the zeroing twice. Before the first `Reset` every chunk
+comes from `make` and so reads as zero; once `Reset` hands a chunk out again it
+holds whatever the previous batch left. `clear` it if you read before writing,
+or hand out a region you only partly fill.
 
 ### Why `Ref` exists
 
@@ -152,7 +182,10 @@ capacity that carried over.
 ## Sizing the chunk
 
 `New[T](chunkBytes)` takes a **byte budget**, not a count of elements, and
-divides it down to a whole number of `T` (never below one). A wider `T` means
+divides it down to a whole number of `T` (never below one). `Make[T]` is the
+same thing as a value rather than a pointer, for an arena that lives as a field
+or a local; `StringArena{Arena: arena.Make[byte](n)}` is what `NewStringArena`
+builds. A wider `T` means
 fewer of them per chunk, not a bigger chunk — so the 64 KiB zero value stays
 sane for a 64-byte struct instead of quietly becoming 4 MiB.
 
@@ -176,7 +209,8 @@ caller to hold up the other end:
 
 1. **Not safe for concurrent use.** One goroutine at a time, or your own lock.
 2. **Every view must be dead before `Reset` or `Release`.** Nothing checks this.
-   A view read afterwards sees whatever the next batch wrote there.
+   A view read afterwards sees whatever the next batch wrote there — and a
+   region from `Reserve` is a view like any other.
 3. **Never mutate what you were handed.** The views alias the arena's own
    storage, and `Intern` and `Str` hand back strings over bytes it still owns.
 

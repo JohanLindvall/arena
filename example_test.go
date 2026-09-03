@@ -131,3 +131,43 @@ func ExampleStringArena_StrRef() {
 	// "level" empty=false
 	// "" empty=true
 }
+
+// Reserve is Append without the copy, for a value that is being built rather than one the
+// caller already has. A decoder that learns an array's length before its elements reserves
+// the backing once and fills it in place — no allocation per value, and no copy out of a
+// scratch buffer either.
+func ExampleArena_Reserve() {
+	a := arena.New[float64](4096)
+
+	// Three points, each backed by the same chunk rather than three make calls.
+	var points [][]float64
+	for _, row := range [][]float64{{1, 2, 3}, {4, 5, 6}, {7, 8, 9}} {
+		p := a.Reserve(len(row)) // length 0, capacity exactly len(row)
+		for _, v := range row {
+			p = append(p, v*10)
+		}
+		points = append(points, p)
+	}
+
+	fmt.Println(points, "-", a.Size(), "bytes stored,", a.Retained(), "retained")
+	// Output: [[10 20 30] [40 50 60] [70 80 90]] - 72 bytes stored, 4096 retained
+}
+
+// Make is New without the allocation, for an arena that lives inside something the caller
+// already has. The zero Arena needs no constructor at all; Make is how a struct field
+// picks a chunk size other than the 64 KiB default.
+func ExampleMake() {
+	type decoder struct {
+		coords arena.Arena[float64]
+		counts arena.Arena[int32]
+	}
+	d := decoder{
+		coords: arena.Make[float64](4096),
+		counts: arena.Make[int32](4096),
+	}
+
+	xs := d.coords.Append([]float64{0.5, 1.5})
+	ns := d.counts.Append([]int32{7})
+	fmt.Println(xs, ns, "-", d.coords.Retained()+d.counts.Retained(), "bytes retained")
+	// Output: [0.5 1.5] [7] - 8192 bytes retained
+}

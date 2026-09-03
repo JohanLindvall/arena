@@ -429,3 +429,136 @@ func Test_unit_Ref_SizeLimits(t *testing.T) {
 	assert.Zero(t, a.Size())
 	assert.Zero(t, a.Retained())
 }
+
+// Test_unit_Arena_ReserveShape pins the two halves of Reserve's contract that a caller
+// builds on: the region is empty with room for exactly n, and it is the caller's alone.
+// The exact capacity is what makes the second half true — filling past n has to
+// reallocate rather than run into the neighbouring value — so a Reserve handing back the
+// rest of the chunk would corrupt silently, which is why cap is asserted and not just len.
+func Test_unit_Arena_ReserveShape(t *testing.T) {
+	a := New[int](4096)
+
+	r := a.Reserve(3)
+	require.Len(t, r, 0, "a reservation starts empty")
+	require.Equal(t, 3, cap(r), "a reservation has room for exactly what was asked for")
+
+	next := a.Reserve(3)
+	r = append(r, 1, 2, 3)
+	require.Equal(t, 3, cap(r), "filling a reservation exactly must not reallocate it")
+	r = append(r, 4) // past the reservation: reallocates, must not reach next
+	next = append(next, 7, 8, 9)
+
+	assert.Equal(t, []int{1, 2, 3, 4}, r)
+	assert.Equal(t, []int{7, 8, 9}, next, "overfilling a reservation must not write into the next one")
+}
+
+// Test_unit_Arena_ReserveExclusiveAndStable is the bulk version of the same property, and
+// the one that would catch an off-by-one in the cursor: every region ever handed out must
+// still read back what was written into it after thousands more reservations, appends and
+// chunks. Reserve and Append are interleaved because they share the placement step.
+func Test_unit_Arena_ReserveExclusiveAndStable(t *testing.T) {
+	a := New[int](512) // 64 ints per chunk, so this spans many chunks
+
+	var regions [][]int
+	for i := range 2000 {
+		r := append(a.Reserve(3), i, i+1, i+2)
+		regions = append(regions, r)
+		a.Append([]int{-i}) // interleaved, to prove the two share one cursor
+	}
+
+	for i, r := range regions {
+		require.Equal(t, []int{i, i + 1, i + 2}, r, "region %d was overwritten", i)
+	}
+}
+
+// Test_unit_Arena_ReserveOversized checks that a reservation too large for a uniform chunk
+// takes the same route Append's oversized values take — its own chunk, marked by capacity,
+// which Reset drops rather than recycling. Retained is the observable, exactly as in
+// Test_unit_Arena_ResetDropsOversizedChunks.
+func Test_unit_Arena_ReserveOversized(t *testing.T) {
+	const chunk = 1 << 12 // bytes
+	a := New[byte](chunk)
+
+	a.Reserve(8)
+	require.Equal(t, chunk, a.Retained(), "a small reservation comes out of one uniform chunk")
+
+	big := a.Reserve(5 * chunk)
+	require.Equal(t, 5*chunk, cap(big), "an oversized reservation is sized to fit exactly")
+	require.Equal(t, chunk+5*chunk, a.Retained())
+
+	// The uniform chunk is still the one being filled: an oversized chunk never becomes
+	// the current one, so the room left beside the first reservation is not stranded.
+	a.Reserve(8)
+	assert.Equal(t, chunk+5*chunk, a.Retained(), "an oversized reservation must not move the cursor")
+
+	a.Reset()
+	assert.Equal(t, chunk, a.Retained(), "Reset drops the oversized chunk and keeps the uniform one")
+}
+
+// Test_unit_Arena_ReserveEmpty pins the n <= 0 answer, which mirrors Append's on empty
+// input: nothing reserved, nothing counted, no chunk allocated.
+func Test_unit_Arena_ReserveEmpty(t *testing.T) {
+	var a Arena[float64]
+	for _, n := range []int{0, -1} {
+		assert.Nil(t, a.Reserve(n), "Reserve(%d) reserves nothing", n)
+	}
+	assert.Zero(t, a.Size())
+	assert.Zero(t, a.Retained(), "reserving nothing must not allocate a chunk")
+}
+
+// Test_unit_Arena_ReserveCountsTowardSize pins Size as the room the batch has TAKEN
+// rather than the elements written into it — the figure a caller bounding a payload
+// needs, and the one a half-filled reservation would otherwise understate.
+func Test_unit_Arena_ReserveCountsTowardSize(t *testing.T) {
+	a := New[int64](4096)
+
+	a.Reserve(10) // reserved and left entirely unwritten
+	assert.Equal(t, 10*8, a.Size(), "Size counts the whole reservation, filled or not")
+
+	a.Append([]int64{1, 2})
+	assert.Equal(t, 12*8, a.Size(), "Reserve and Append count the same way")
+
+	a.Reset()
+	assert.Zero(t, a.Size())
+}
+
+// Test_unit_Arena_ReserveFreshChunksReadZero pins the contents half of Reserve's doc: it
+// clears nothing, but a chunk the arena has not yet reused comes from make and so reads
+// as zero. That is the property a caller who only partly fills a region relies on, and it
+// is exactly as far as the guarantee goes — hence the Reset half.
+func Test_unit_Arena_ReserveFreshChunksReadZero(t *testing.T) {
+	a := New[int](4096)
+
+	r := a.Reserve(4)
+	assert.Equal(t, []int{0, 0, 0, 0}, r[:4], "a region from a fresh chunk reads as zero")
+
+	copy(r[:4], []int{9, 9, 9, 9})
+	a.Reset()
+
+	// Same chunk, handed out again: Reserve does not clear, so the previous batch shows
+	// through. Documented, and what `clear` is for.
+	reused := a.Reserve(4)
+	assert.Equal(t, []int{9, 9, 9, 9}, reused[:4],
+		"Reserve must not pay to clear a reused chunk; the doc says so and callers clear if they care")
+}
+
+// Test_unit_Make checks that Make is New without the allocation: same chunk sizing, same
+// behaviour, as a value.
+func Test_unit_Make(t *testing.T) {
+	const chunk = 4096
+
+	value := Make[int64](chunk)
+	pointer := New[int64](chunk)
+	require.Equal(t, pointer.chunkLen(), value.chunkLen(), "Make and New must size chunks identically")
+	assert.Equal(t, chunk/8, value.chunkLen(), "a byte budget divides down to a whole number of T")
+
+	// Usable as a struct field without a constructor call, which is the point.
+	holder := struct{ a Arena[int64] }{a: Make[int64](chunk)}
+	holder.a.Append([]int64{1, 2, 3})
+	assert.Equal(t, chunk, holder.a.Retained())
+
+	// And StringArena takes its chunk size the same way, as its doc claims.
+	sa := StringArena{Arena: Make[byte](chunk)}
+	assert.Equal(t, "hello", sa.Intern("hello"))
+	assert.Equal(t, chunk, sa.Retained())
+}

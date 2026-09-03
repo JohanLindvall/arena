@@ -71,7 +71,19 @@ type Arena[T any] struct {
 // chunk — chunk size decides the tail waste, since a value that does not fit the current
 // chunk starts a new one and strands the remainder.
 func New[T any](chunkBytes int) *Arena[T] {
-	return &Arena[T]{chunk: chunkElems[T](chunkBytes)}
+	a := Make[T](chunkBytes)
+	return &a
+}
+
+// Make is New as a VALUE rather than a pointer, for an arena that lives as a field of a
+// struct the caller already has, or as a local — where New's allocation buys nothing.
+// The zero Arena is usable and needs neither, so reach for Make only to choose a chunk
+// size: `Make[T](n)` is to `var a Arena[T]` what `New[T](n)` is to `new(Arena[T])`.
+//
+// A StringArena takes its chunk size the same way, through the embedded field:
+// `StringArena{Arena: Make[byte](n)}` is what NewStringArena builds.
+func Make[T any](chunkBytes int) Arena[T] {
+	return Arena[T]{chunk: chunkElems[T](chunkBytes)}
 }
 
 // chunkLen is the backing-chunk capacity in elements, defaulted on first use.
@@ -82,40 +94,75 @@ func (a *Arena[T]) chunkLen() int {
 	return a.chunk
 }
 
-// store copies v into the arena and returns where it landed: the index of the chunk, the
-// offset within it, and a view over the copy. Append and AppendRef are both thin wrappers
-// over this and each wants a different half of that answer — the half either one ignores
-// costs it nothing, since store inlines into both. v must not be empty, which the two of
-// them screen for first, because they answer it differently.
-func (a *Arena[T]) store(v []T) (chunk, off int, view []T) {
-	a.size += len(v)
-	n := a.chunkLen()
+// place advances the arena past n elements and returns where they landed: the index of
+// the chunk, the offset within it, and the region itself, length n. It is the whole of
+// the placement policy, so the chunk invariants live here and nowhere else.
+//
+// src is either nil, meaning reserve n elements and leave them alone, or the value to
+// copy in, in which case n is derived from it and the argument ignored. Append and
+// AppendRef pass their value; Reserve passes nil and its count. Either way the count must
+// be positive, which every caller screens for first.
+//
+// region comes back in the shape its caller wants — length n over the copy for the two
+// storing entry points, length 0 with capacity exactly n for Reserve — because shaping it
+// here is free (place is far past the inline budget and never inlines) where doing it in
+// the caller is not: Append inlines at a cost of 80 against a budget of 80 and Reserve at
+// 79, so a couple of nodes either way decides whether they cost a call.
+func (a *Arena[T]) place(src []T, n int) (chunk, off int, region []T) {
+	if src != nil {
+		n = len(src)
+	}
+	a.size += n
+	c := a.chunkLen()
 
 	// A value too large for a uniform chunk gets one of its own, sized to fit it exactly
 	// and parked at the end of the list WITHOUT moving idx. Leaving idx alone matters: the
 	// new chunk is full the moment it is made, so stepping onto it would strand whatever
 	// room is left in the chunk the next ordinary value is going to want. Reset drops these
 	// rather than recycling them, which is what keeps the reusable chunks one size.
-	if len(v) > n {
-		big := make([]T, len(v)) // exactly len(v), so isOversized can read it off the cap
-		copy(big, v)
+	if n > c {
+		// The two arms differ only in a compiler optimisation, and it is worth real time:
+		// a make the compiler can see is immediately and completely overwritten skips its
+		// zeroing, and it can only see that when the make and the copy sit together with
+		// the length written the same way in both. Splitting them — even just moving the
+		// copy to the caller — costs a whole extra pass over the value: measured at
+		// Append/65537 +27%, and 3.40 -> 4.33 us on a 64 KiB make+copy micro. Reserve
+		// wants the zeroed allocation anyway, which is what its doc promises.
+		if src == nil {
+			big := make([]T, n) // exactly n, so isOversized can read it off the cap
+			a.chunks = append(a.chunks, big)
+			return len(a.chunks) - 1, 0, big[:0]
+		}
+		big := make([]T, len(src))
+		copy(big, src)
 		a.chunks = append(a.chunks, big)
 		return len(a.chunks) - 1, 0, big
 	}
 
 	// Skip chunks that lack room; never grow an existing chunk in place (that could
 	// reallocate and invalidate views already handed out from it).
-	for a.idx < len(a.chunks) && cap(a.chunks[a.idx])-len(a.chunks[a.idx]) < len(v) {
+	for a.idx < len(a.chunks) && cap(a.chunks[a.idx])-len(a.chunks[a.idx]) < n {
 		a.idx++
 	}
 	if a.idx == len(a.chunks) {
-		a.chunks = append(a.chunks, make([]T, 0, n))
+		a.chunks = append(a.chunks, make([]T, 0, c))
 	}
 	cur := a.chunks[a.idx]
 	off = len(cur)
-	cur = append(cur, v...) // in-cap append: same backing array, no reallocation
+	cur = cur[:off+n] // in-cap reslice: same backing array, no reallocation
 	a.chunks[a.idx] = cur
-	return a.idx, off, cur[off:]
+	// Reserve's region is capped at exactly n so that overfilling it reallocates instead
+	// of writing over the next value; the storing entry points keep the uncapped view
+	// they have always handed back. The copy is guarded rather than unconditional over a
+	// possibly-nil src because the chunk is already allocated here — there is no zeroing
+	// to elide, so nothing is gained by keeping it adjacent, while an unguarded copy would
+	// put a zero-length memmove CALL on Reserve's hot path.
+	if src == nil {
+		return a.idx, off, cur[off : off : off+n]
+	}
+	region = cur[off : off+n]
+	copy(region, src)
+	return a.idx, off, region
 }
 
 // isOversized reports whether c was made to hold a single value too large for a uniform
@@ -135,8 +182,43 @@ func (a *Arena[T]) Append(v []T) []T {
 	if len(v) == 0 {
 		return nil
 	}
-	_, _, view := a.store(v)
-	return view
+	_, _, region := a.place(v, 0)
+	return region
+}
+
+// Reserve hands back room for n elements — a slice of length 0 and capacity exactly n,
+// backed by arena storage — for a caller that fills the region itself rather than copying
+// a value in. It is Append without the copy, and the two can be mixed freely on one
+// arena. n <= 0 reserves nothing and returns nil.
+//
+// Where Append is for a value the caller already has, Reserve is for one being built:
+// a decoder that knows an array's length before its elements can reserve the backing once
+// and append the elements into it, paying neither a per-value allocation nor a copy out of
+// a scratch buffer.
+//
+// The capacity is exactly n, not the rest of the chunk, so filling the region past n
+// reallocates to the heap the way any other full slice does and can never write over the
+// neighbouring value. The region is the caller's alone: no later Append or Reserve
+// overlaps it, and the view stays valid until Reset or Release exactly as Append's does.
+// A value larger than a whole chunk gets a chunk of its own, as in Append.
+//
+// # Contents
+//
+// Reserve does not clear what it hands back, since a caller that is about to fill the
+// region would pay for the zeroing twice. In a chunk the arena has not yet reused — every
+// chunk before the first Reset — the memory comes from make and so reads as zero; after a
+// Reset hands the same chunk out again it holds whatever the previous batch left there.
+// A caller that reads before writing, or that hands out a region it only partly fills,
+// wants `clear` over it (or an arena it never Resets).
+//
+// Size counts the whole reservation, filled or not: it is the room the batch has taken,
+// which is what a caller bounding a payload is asking about.
+func (a *Arena[T]) Reserve(n int) []T {
+	if n <= 0 {
+		return nil
+	}
+	_, _, region := a.place(nil, n)
+	return region
 }
 
 // Ref locates a value in the arena WITHOUT a pointer to it — a chunk index and a range
@@ -198,7 +280,7 @@ func (a *Arena[T]) AppendRef(v []T) Ref[T] {
 	if len(v) == 0 {
 		return Ref[T]{}
 	}
-	i, off, _ := a.store(v)
+	i, off, _ := a.place(v, 0)
 	end := off + len(v)
 	// Only two things can reach here past the bound: a single value longer than 2^31-1
 	// elements, and an arena built with New over a chunk that wide. The uniform path
