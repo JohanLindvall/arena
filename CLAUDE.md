@@ -33,6 +33,12 @@ in the push overrides:
 | `#major`, or a line starting `BREAKING CHANGE:` | major |
 | `[skip release]` in the head commit | nothing is tagged |
 
+Only successful push or manual CI runs on this repository's `main` can release;
+pull request runs cannot. To request a release manually, dispatch **CI**, not Release.
+Already tagged commits, commits removed from `main`, and commits that do not
+descend from the latest release are skipped. The ancestry check prevents a late
+CI completion from releasing older code under a newer version.
+
 Pre-1.0, an observable behaviour change takes `#minor` — that is what v0.2.0
 was. Never tag by hand: the workflow reads the highest existing `vX.Y.Z` tag to
 decide the next one, so a manual tag silently moves the series.
@@ -50,12 +56,16 @@ golangci-lint run                   # v2, version pinned in .github/workflows/ci
 go test -run='^$' -bench=. -benchtime=1x ./...
 ```
 
-Coverage sits at 98.9% of statements, and the shortfall is exactly one line:
+Coverage sits at 99.0% of statements, and the shortfall is exactly one line:
 the `too many chunks` panic in `AppendRef`, which needs 2^31 chunks to reach —
 51 GB of slice headers before any data. Keep it anyway; without it a chunk index
 past 2^32 wraps small-positive and `Value` silently reads the wrong chunk. Every
 other statement is covered, so treat a drop below that as a real gap rather than
 noise.
+
+`FuzzArena` mixes Append, AppendRef, Reserve, Reset and Release while checking
+all live values and Size. Its seed corpus runs with the ordinary tests; use
+`go test -fuzz=FuzzArena -fuzztime=20s ./...` for a longer randomized check.
 
 `.golangci.yml` carries two deliberate gosec exclusions, G103 (unsafe) and G115
 (the int32 narrowing in `AppendRef`). Both name a **file path**, so moving code
@@ -69,6 +79,16 @@ stripped and confirming the findings are the ones the rules claim to cover.
 - **A chunk is never reallocated once a view points into it.** Views alias chunk
   storage directly, so growing a chunk in place would corrupt live data rather
   than error. A value that does not fit starts a new chunk.
+- **An arena must not be copied after first use.** Its chunks would be shared
+  while placement state diverges. A nonempty Ref belongs to its originating
+  arena and batch, and expires at Reset or Release just like a view.
+- **Size counts successful placements, even unfilled reservations.** Increment
+  it only after allocation succeeds. An allocation panic must not corrupt a
+  recovered caller's payload accounting. AppendRef's descriptor-limit panic is
+  different: it follows a successful placement, which still counts.
+- **Reset retains uniform chunk contents, including pointers.** Those pointers
+  keep their targets alive until overwritten or released. Do not imply Reset
+  clears bytes or that Retained includes pointees or bookkeeping overhead.
 - **An oversized chunk marks itself by its capacity.** `place` builds uniform
   chunks at exactly `chunkLen` and oversized ones at exactly the value's length,
   which is the whole basis for `isOversized`, which is what lets `Reset` drop
@@ -88,7 +108,9 @@ stripped and confirming the findings are the ones the rules claim to cover.
   prove it. Note `Append`'s view is NOT capped this way — it carries the chunk's
   slack, so appending to one corrupts the arena; that is what rule 3 ("never
   mutate what you were handed") covers, and it is why `Reserve` exists for
-  callers who mean to fill a region themselves.
+  callers who mean to fill a region themselves. That region is writable; the
+  read-only rule applies to the copying entry points and Value. To clear a
+  reservation, use `clear(region[:cap(region)])`, since its length starts at zero.
 
 ## Two compiler thresholds this package sits right on top of
 
@@ -110,7 +132,7 @@ Both were found the same way — a refactor that changed no logic at all and cos
   `Arena[uint8]` figures are far lower and will mislead you. Base `Append` was
   79, and one extra argument took it to 81 and stopped it inlining, worth
   **+15%** on `Append/16`. That is the whole reason `place` shapes the returned
-  region instead of the callers doing it: `place` costs 213 and never inlines,
+  region instead of the callers doing it: `place` costs 221 and never inlines,
   so work moved into it is free and work moved out of it is not.
 - **`Ref` stays 12 bytes and pointer-free.** That is its entire reason to exist
   over the `[]T` from `Append`; a test asserts `unsafe.Sizeof`.
@@ -130,9 +152,9 @@ The README quotes medians of five runs. Two things to respect:
   `clone` arms of `BenchmarkIntern` never change, so they read as a baseline,
   and `BenchmarkAppendRef` runs both store paths side by side. A within-run
   comparison is how the one real regression in this repo was caught.
-- **`BenchmarkIntern/arena/4096` swings by tens of percent** because a batch no
-  longer fits the chunks and chunk allocation dominates. The README says so; do
-  not quote it as a firm number.
+- **`BenchmarkIntern/arena/4096` swings by tens of percent.** Its 16 MiB batch
+  spans 256 chunks; only the first batch allocates them, while later batches
+  reuse them. The README notes the variability; do not quote it as a firm number.
 
 Benchmarks that retain a batch must bound what they hold. An oversized value now
 occupies a chunk until `Reset`, so `BenchmarkAppend` caps live bytes rather than

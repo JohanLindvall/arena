@@ -10,7 +10,7 @@ go vet ./...
 go test -race -shuffle=on ./...     # -race matters: the package hands out unsafe views
 go mod tidy -diff                   # must be a no-op
 golangci-lint run                   # v2, config in .golangci.yml
-go test -run='^$' -bench=. ./...
+go test -run='^$' -bench=. -benchtime=1x ./...
 ```
 
 `golangci-lint` is pinned in [.github/workflows/ci.yml](.github/workflows/ci.yml);
@@ -23,10 +23,13 @@ from the code the way prose does.
 
 ## Releases are automatic
 
-Every commit that lands on `main` and passes CI gets a tag and a GitHub release,
-cut by [.github/workflows/release.yml](.github/workflows/release.yml). Patch by
-default. To ask for something else, put a marker anywhere in a commit message in
-the push:
+Successful CI runs for pushes to `main` in this repository trigger
+[release.yml](.github/workflows/release.yml). The workflow tags the exact commit
+CI validated, skipping commits already tagged, no longer on `main`, or older
+than/divergent from the latest release. Pull request runs cannot publish.
+To trigger it manually, dispatch **CI** on `main`; release always waits for those
+checks to pass. Patch by default. To ask for something else, put a marker anywhere
+in a commit message in the push:
 
 | Marker | Bump |
 | --- | --- |

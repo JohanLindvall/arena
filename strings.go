@@ -8,7 +8,8 @@ import "unsafe"
 //
 // Everything Arena[byte] does is promoted, so a StringArena stores raw bytes and hands out
 // Ref[byte] descriptors too, and the embedded field is addressable as a.Arena for code that
-// wants the plain arena. The zero value is usable, with 64 KiB chunks.
+// wants the plain arena. The zero value is usable, with 64 KiB chunks. Like Arena,
+// StringArena must not be copied after first use and is not safe for concurrent use.
 //
 // There are two ways to hold what it stores, matching the two on Arena. Intern hands back a
 // string view, which is what a caller with a bounded number of live values wants; StrRef
@@ -20,9 +21,9 @@ type StringArena struct {
 }
 
 // NewStringArena returns a string arena with a chunk size of its own, as [New] does. Bytes
-// and elements are the same thing here, so chunkBytes is exactly the chunk capacity.
+// and elements are the same thing here, so max(1, chunkBytes) is the chunk capacity.
 func NewStringArena(chunkBytes int) *StringArena {
-	return &StringArena{Arena: Arena[byte]{chunk: chunkElems[byte](chunkBytes)}}
+	return &StringArena{Arena: Make[byte](chunkBytes)}
 }
 
 // b2s returns a string view over b without copying. The caller must guarantee b
@@ -39,7 +40,8 @@ func s2b(s string) []byte {
 
 // Intern copies s into the arena and returns a stable string view over the copy. A string
 // larger than a whole chunk gets a chunk of its own, which Reset drops rather than
-// recycling — see [Arena.Append].
+// recycling — see [Arena.Append]. Each call copies its input; equal strings are not
+// deduplicated. The empty string stores nothing and returns "".
 func (a *StringArena) Intern(s string) string {
 	if len(s) == 0 {
 		return ""
@@ -53,8 +55,9 @@ func (a *StringArena) Intern(s string) string {
 //
 // The empty string gives the zero Ref, which Str resolves back to "".
 //
-// s must be shorter than 2 GiB, the bound a [Ref] can describe, and nothing checks that it
-// is — a longer string comes back from Str as "" or truncated. Intern has no such limit.
+// Like AppendRef, it panics if the stored range or chunk index exceeds the limits of
+// [Ref], including strings of 2 GiB or more. The check follows the copy, so a recovered
+// panic leaves the value stored but undescribed. Intern has no such limit.
 func (a *StringArena) StrRef(s string) Ref[byte] {
 	if len(s) == 0 {
 		return Ref[byte]{}
@@ -63,7 +66,8 @@ func (a *StringArena) StrRef(s string) Ref[byte] {
 }
 
 // Str resolves r to a string view over the arena's copy — the string counterpart of Value.
-// The absent descriptor resolves to the empty string.
+// The absent descriptor resolves to the empty string. A nonempty r must belong to this
+// arena's current batch; see [Ref]. The view stays valid until Reset or Release.
 func (a *StringArena) Str(r Ref[byte]) string {
 	return b2s(a.Value(r))
 }

@@ -7,7 +7,6 @@ on:
     workflows: [CI]
     types: [completed]
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -23,16 +22,20 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       github.repository == 'JohanLindvall/arena' &&
-      (github.event_name == 'workflow_dispatch' ||
-       github.event.workflow_run.conclusion == 'success')
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == 'main' &&
+      (github.event.workflow_run.event == 'push' ||
+       github.event.workflow_run.event == 'workflow_dispatch')
     env:
-      # workflow_run reports the commit CI ran on; a manual dispatch tags its own ref.
-      TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      # Only successful CI runs in this repository can select a release commit.
+      # To request a release manually, dispatch CI on main so validation cannot be bypassed.
+      TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.event.workflow_run.head_sha }}
           # Full history and tags: the version bump reads both.
           fetch-depth: 0
           filter: tree:0
@@ -73,9 +76,14 @@ jobs:
             echo "$latest + $level -> $next"
           fi
 
-          # Reasons to do nothing, both of which are normal rather than failures.
+          # CI runs can complete out of order or be retried after main has moved.
+          # Never publish an older or divergent commit as a newer version.
           skip=""
-          if git tag --points-at "$TARGET_SHA" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+          if ! git merge-base --is-ancestor "$TARGET_SHA" origin/main; then
+            skip="commit is no longer on main"
+          elif [ -n "$latest" ] && ! git merge-base --is-ancestor "$latest" "$TARGET_SHA"; then
+            skip="commit does not descend from the latest release"
+          elif git tag --points-at "$TARGET_SHA" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             skip="commit is already tagged"
           elif grep -qiE '\[skip release\]|\[release skip\]' \
               <<<"$(git log -1 --format='%B' "$TARGET_SHA")"; then

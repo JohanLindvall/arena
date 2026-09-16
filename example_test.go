@@ -83,7 +83,7 @@ func ExampleArena_Release() {
 	a := arena.New[byte](4096)
 	a.Append(make([]byte, 3000))
 
-	// Reset drops the bytes and keeps the chunks, for an owner about to refill them.
+	// Reset resets Size and keeps the chunks without clearing their contents.
 	a.Reset()
 	fmt.Println("after Reset:", a.Size(), "bytes stored,", a.Retained(), "retained")
 
@@ -151,6 +151,21 @@ func ExampleArena_Reserve() {
 
 	fmt.Println(points, "-", a.Size(), "bytes stored,", a.Retained(), "retained")
 	// Output: [[10 20 30] [40 50 60] [70 80 90]] - 72 bytes stored, 4096 retained
+}
+
+// Reset retains chunk contents. Clear the whole reservation before partially filling
+// it: clearing Reserve's length-zero result alone would leave the old values in place.
+func ExampleArena_Reserve_clear() {
+	var a arena.Arena[int]
+	a.Append([]int{7, 8, 9})
+	a.Reset()
+
+	p := a.Reserve(3)
+	clear(p[:cap(p)])
+	p = p[:3]
+	p[0] = 42
+	fmt.Println(p)
+	// Output: [42 0 0]
 }
 
 // Make is New without the allocation, for an arena that lives inside something the caller

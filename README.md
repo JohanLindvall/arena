@@ -70,6 +70,9 @@ below, is the one entry point that does not copy.)
 interoperate freely. All four store through one path, so they agree on
 everything except what they hand back.
 
+Copies are shallow: pointer-bearing elements still refer to the original objects.
+`Intern` copies each string on every call; it does not deduplicate equal strings.
+
 Every view is **one contiguous slice**. A value that does not fit the current
 chunk starts a new chunk rather than being split, so nothing has to be
 reassembled on the way out.
@@ -105,6 +108,14 @@ region would pay for the zeroing twice. Before the first `Reset` every chunk
 comes from `make` and so reads as zero; once `Reset` hands a chunk out again it
 holds whatever the previous batch left. `clear` it if you read before writing,
 or hand out a region you only partly fill.
+
+Clear the **full reservation**, since the returned slice has length zero:
+
+```go
+p := a.Reserve(n)
+clear(p[:cap(p)])
+p = p[:n]                       // safe to read all n elements, including unwritten ones
+```
 
 ### Why `Ref` exists
 
@@ -145,10 +156,13 @@ Three `int32`s are what make a `Ref` small, and also what bound it. The bound is
 value stored through `AppendRef`/`StrRef`, and an arena `New` was given a chunk
 that wide. A third, 2³¹ chunks at once, is out of reach at any sane chunk size.
 
-**`AppendRef` panics rather than let the conversion wrap**, so crossing the bound
+**`AppendRef` and `StrRef` panic rather than let the conversion wrap**, so crossing the bound
 is loud. The check measures free: the uniform store path already caps the offset
 at the chunk's own capacity, so only an oversized value or an over-wide chunk can
 get near it, and the branch is never taken in ordinary use.
+
+The check happens after storing the value. Recovering the panic leaves that
+value counted in `Size` until the next rewind.
 
 It is worth naming what the panic stands in for. Unguarded, a length between 2³¹
 and 2³² wraps `end` negative, so `Empty` reports the value **absent** and `Value`
@@ -161,28 +175,37 @@ to reach for when a value could approach it.
 
 ## Rewinding
 
-| Call | Bytes | Uniform chunks | Oversized chunks |
+| Call | `Size()` afterwards | Uniform chunks | Oversized chunks |
 | --- | --- | --- | --- |
-| `Reset()` | dropped | **kept**, ready to be refilled | **freed** |
-| `Release()` | dropped | **freed** | **freed** |
+| `Reset()` | 0 | **kept**, contents unchanged | **dropped** |
+| `Release()` | 0 | **dropped** | **dropped** |
 
 `Reset` is for an owner about to run the next batch: re-allocating the chunks
 would be the largest allocation it makes, so it does not. `Release` is for an
 owner that outlives its bytes — a pooled writer parked empty between batches,
 which should retain its per-value bookkeeping and none of the values.
 
+`Reset` does not erase stored data. If `T` contains pointers, old elements in
+reused chunks keep their targets alive until overwritten or the chunks are
+released. Use `Release` when those targets should become collectible between
+batches. Dropping a chunk makes it eligible for garbage collection once no
+other references to it remain; it does not immediately return memory to the OS.
+
 Two counters describe the arena, both in bytes whatever `T` is. `Size` is the
 bytes stored since the last rewind, which is what you check against a payload
-budget; `Retained` is the chunk capacity holding them, which is the actual
-footprint. A burst grows the chunk list and `Reset` never shrinks the uniform
-part of it, so `Retained` is the number a trim policy should watch. Mid-batch it
+budget. It includes unfilled reservations, but excludes failed allocations.
+`Retained` is the chunk capacity holding them, excluding chunk headers, allocator
+overhead, and objects referenced by `T`. A burst grows the chunk list and `Reset`
+never shrinks the uniform part of it, so `Retained` is the number a trim policy
+should watch. Mid-batch it
 counts any oversized chunks in flight; between batches it is the uniform
 capacity that carried over.
 
 ## Sizing the chunk
 
 `New[T](chunkBytes)` takes a **byte budget**, not a count of elements, and
-divides it down to a whole number of `T` (never below one). `Make[T]` is the
+divides it down to a whole number of `T` (never below one, even with a zero or
+negative budget). `Make[T]` is the
 same thing as a value rather than a pointer, for an arena that lives as a field
 or a local; `StringArena{Arena: arena.Make[byte](n)}` is what `NewStringArena`
 builds. A wider `T` means
@@ -195,7 +218,7 @@ Interning short strings is comfortable at the default; accumulating large rows
 or blocks wants something closer to 1 MiB.
 
 A value larger than a whole chunk gets a chunk of its own, sized to fit it
-exactly. All four entry points do the same thing with one, so an oversized value
+exactly. Copying and reserving follow the same rule, so an oversized value
 is `Ref`-addressable like any other. `Reset` **drops** those chunks instead of
 recycling them — one was made to fit a single large value and is the wrong shape
 for anything else, so keeping it would leave that value's memory in the reusable
@@ -204,15 +227,21 @@ lumpy the batch that just ran was.
 
 ## The rules
 
-The arena trades safety for speed in three specific places, and it is on the
-caller to hold up the other end:
+The caller must observe these rules:
 
 1. **Not safe for concurrent use.** One goroutine at a time, or your own lock.
-2. **Every view must be dead before `Reset` or `Release`.** Nothing checks this.
+2. **Every view and `Ref` expires at `Reset` or `Release`.** Nothing checks this.
    A view read afterwards sees whatever the next batch wrote there — and a
-   region from `Reserve` is a view like any other.
-3. **Never mutate what you were handed.** The views alias the arena's own
-   storage, and `Intern` and `Str` hand back strings over bytes it still owns.
+   region from `Reserve` is a view like any other. Resolve a nonempty `Ref` only
+   against the arena and batch that created it; misuse can return unrelated data
+   or panic.
+3. **Views from `Append` and `Value` are read-only.** Do not modify or append to
+   them: their capacity can extend into neighbouring values, including bytes
+   exposed as immutable strings by `Intern` and `Str`. `Reserve` is the explicit
+   exception: its region is yours to fill, with capacity limited to its size.
+4. **Do not copy an arena after first use.** This includes `StringArena` and
+   structs containing either type. Copies share storage but track placement
+   independently, so they can overwrite each other's values. Pass a pointer.
 
 What the arena saves is object *count*, not scan work: for a `T` that contains
 pointers the chunks are still scanned, they are simply a handful of large
@@ -237,9 +266,9 @@ stack-allocated and proves nothing:
 | 256 B | 8.9 ns/op, 0 allocs | 60.1 ns/op, 1 alloc |
 | 4 KiB | 152 ns/op, 0 allocs | 647 ns/op, 1 alloc |
 
-At 4 KiB a batch no longer fits the chunks, so that row is dominated by chunk
-allocation and moves by tens of percent between runs; the two smaller ones are
-stable to a few percent.
+The 4 KiB row moves by tens of percent between runs; the two smaller ones are
+stable to a few percent. That batch occupies 16 MiB across 256 default chunks.
+The first batch allocates them; subsequent batches reuse them through `Reset`.
 
 The collector is the other half of the story. Holding 2²⁰ descriptors live and
 timing one full GC cycle over each form — same bytes in the arena either way,

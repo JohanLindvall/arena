@@ -184,6 +184,7 @@ func BenchmarkBatchCycle(b *testing.B) {
 				for _, r := range refs {
 					total += len(a.Value(r))
 				}
+				runtime.KeepAlive(total)
 				if release {
 					a.Release()
 				} else {

@@ -11,7 +11,8 @@
 // parameter: [StringArena] is an Arena[byte] with the string entry points added.
 //
 // It is not safe for concurrent use. Every view handed out must be dead before Reset or
-// Release, and callers must not mutate what they were handed.
+// Release. Views from the copying entry points are read-only; regions from Reserve
+// may be filled by the caller.
 package arena
 
 import "unsafe"
@@ -41,8 +42,10 @@ func chunkElems[T any](chunkBytes int) int {
 // Arena copies slices of T into chunk-backed storage and hands back views over the copies.
 // A view stays valid until Reset: chunks are never reallocated once allocated (a value that
 // does not fit the current chunk goes into a fresh one), so storing more never invalidates
-// earlier views. Reset rewinds the arena to reuse the existing chunks. It is not safe for
-// concurrent use.
+// earlier views. Reset rewinds the arena to reuse the existing chunks. An Arena must not
+// be copied after first use and is not safe for concurrent use. Copies would share storage
+// but track placement independently. References must be resolved against the original
+// arena before its next Reset or Release.
 //
 // The chunks the arena reuses are all one size. A value too large for one gets a chunk of
 // its own instead, which Reset drops rather than recycling, so a single huge value cannot
@@ -51,7 +54,8 @@ func chunkElems[T any](chunkBytes int) int {
 // What the arena saves is object count, not scan work: for a T that contains pointers the
 // chunks are still scanned, they are simply a handful of large objects rather than one per
 // value. For a pointer-free T the chunks are noscan and the collector ignores them
-// outright.
+// outright. Reset does not clear reused chunks, so pointers in them keep their targets
+// alive until overwritten or the chunks are released. Copies of T are shallow.
 type Arena[T any] struct {
 	chunks [][]T
 	idx    int // index of the chunk currently being filled
@@ -69,7 +73,8 @@ type Arena[T any] struct {
 // New returns an arena with a chunk size of its own, given as a byte budget and rounded
 // down to a whole number of T. Use it when the values are large relative to the default
 // chunk — chunk size decides the tail waste, since a value that does not fit the current
-// chunk starts a new one and strands the remainder.
+// chunk starts a new one and strands the remainder. The capacity is at least one element,
+// even for a zero or negative budget. No chunk is allocated until a value is stored.
 func New[T any](chunkBytes int) *Arena[T] {
 	a := Make[T](chunkBytes)
 	return &a
@@ -112,7 +117,6 @@ func (a *Arena[T]) place(src []T, n int) (chunk, off int, region []T) {
 	if src != nil {
 		n = len(src)
 	}
-	a.size += n
 	c := a.chunkLen()
 
 	// A value too large for a uniform chunk gets one of its own, sized to fit it exactly
@@ -131,11 +135,13 @@ func (a *Arena[T]) place(src []T, n int) (chunk, off int, region []T) {
 		if src == nil {
 			big := make([]T, n) // exactly n, so isOversized can read it off the cap
 			a.chunks = append(a.chunks, big)
+			a.size += n
 			return len(a.chunks) - 1, 0, big[:0]
 		}
 		big := make([]T, len(src))
 		copy(big, src)
 		a.chunks = append(a.chunks, big)
+		a.size += n
 		return len(a.chunks) - 1, 0, big
 	}
 
@@ -151,6 +157,7 @@ func (a *Arena[T]) place(src []T, n int) (chunk, off int, region []T) {
 	off = len(cur)
 	cur = cur[:off+n] // in-cap reslice: same backing array, no reallocation
 	a.chunks[a.idx] = cur
+	a.size += n // count only storage obtained successfully, including after a recovered panic
 	// Reserve's region is capped at exactly n so that overfilling it reallocates instead
 	// of writing over the next value; the storing entry points keep the uncapped view
 	// they have always handed back. The copy is guarded rather than unconditional over a
@@ -178,6 +185,9 @@ func (a *Arena[T]) isOversized(c []T) bool { return cap(c) > a.chunkLen() }
 //
 // A value larger than a whole chunk gets a chunk of its own, which Reset drops rather than
 // recycling — see [Arena].
+//
+// Empty input returns nil. The view is read-only: do not modify or append to it, since its
+// capacity can extend into neighbouring values. Use Reserve to build a value in place.
 func (a *Arena[T]) Append(v []T) []T {
 	if len(v) == 0 {
 		return nil
@@ -209,10 +219,12 @@ func (a *Arena[T]) Append(v []T) []T {
 // chunk before the first Reset — the memory comes from make and so reads as zero; after a
 // Reset hands the same chunk out again it holds whatever the previous batch left there.
 // A caller that reads before writing, or that hands out a region it only partly fills,
-// wants `clear` over it (or an arena it never Resets).
+// wants `clear(region[:cap(region)])` (or an arena it never Resets). Clearing the returned
+// length-zero slice alone does nothing.
 //
 // Size counts the whole reservation, filled or not: it is the room the batch has taken,
-// which is what a caller bounding a payload is asking about.
+// which is what a caller bounding a payload is asking about. If allocating the region
+// panics, the failed reservation does not count toward Size.
 func (a *Arena[T]) Reserve(n int) []T {
 	if n <= 0 {
 		return nil
@@ -237,6 +249,9 @@ func (a *Arena[T]) Reserve(n int) []T {
 //
 // The zero Ref is the ABSENT value: a stored value is never zero elements long (AppendRef
 // returns the zero Ref for empty input), so end <= off cannot name a real one.
+// A nonempty Ref belongs to the arena and batch that created it. Using it with another
+// arena or after Reset or Release is invalid and may panic or return unrelated data;
+// ownership and lifetime are not checked.
 //
 // # Limits
 //
@@ -295,7 +310,9 @@ func (a *Arena[T]) AppendRef(v []T) Ref[T] {
 	return Ref[T]{chunk: int32(i), off: int32(off), end: int32(end)}
 }
 
-// Value resolves r against the arena, or nil for the absent descriptor.
+// Value resolves r against the arena, or nil for the absent descriptor. A nonempty r must
+// belong to this arena's current batch; see [Ref]. The returned view is read-only and,
+// like Append's, must not be modified or appended to.
 func (a *Arena[T]) Value(r Ref[T]) []T {
 	if r.Empty() {
 		return nil
@@ -303,7 +320,9 @@ func (a *Arena[T]) Value(r Ref[T]) []T {
 	return a.chunks[r.chunk][r.off:r.end]
 }
 
-// Size reports the bytes stored since the last Reset or Release.
+// Size reports the bytes stored since the last Reset or Release, including unfilled
+// reservations. Failed allocations do not count; a value stored before AppendRef's
+// descriptor-limit panic does.
 func (a *Arena[T]) Size() int { return a.size * elemSize[T]() }
 
 // Reset rewinds the arena so its chunks are reused for the next round. The caller
@@ -313,6 +332,10 @@ func (a *Arena[T]) Size() int { return a.size * elemSize[T]() }
 // value and is the wrong shape for anything else, so recycling it would leave that value's
 // memory in the reusable set for as long as the arena lives. What survives a Reset is
 // uniform, however lumpy the batch that just ran was.
+//
+// Reused chunks are not cleared. If T contains pointers, those pointers keep their targets
+// alive until overwritten or released, even though Size is zero. Release drops all chunks
+// when retaining the previous batch's targets is undesirable. Reset invalidates Refs too.
 func (a *Arena[T]) Reset() {
 	kept := a.chunks[:0]
 	for _, c := range a.chunks {
@@ -338,8 +361,8 @@ func (a *Arena[T]) Release() {
 }
 
 // Retained reports the bytes the arena is holding — its chunk capacity, which is the real
-// footprint a trim policy should judge (a burst grows the chunk list; Reset rewinds but
-// never shrinks it).
+// storage a trim policy should judge (a burst grows the chunk list; Reset keeps the uniform
+// chunks). It excludes chunk headers, allocator overhead, and objects referenced by T.
 //
 // Mid-batch this counts any oversized chunks in flight. Reset drops those, so what it
 // reports between batches is the uniform capacity that carries over.

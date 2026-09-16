@@ -28,7 +28,9 @@ func TestArenaInternBasic(t *testing.T) {
 func TestArenaInternCopies(t *testing.T) {
 	var a StringArena
 	src := []byte("hello")
-	got := a.Intern(string(src))
+	// Share the input string with src so this tests Intern's copy, not the copy
+	// that an ordinary string(src) conversion would already have made.
+	got := a.Intern(b2s(src))
 	for i := range src {
 		src[i] = 'x'
 	}
@@ -504,6 +506,47 @@ func Test_unit_Arena_ReserveEmpty(t *testing.T) {
 	}
 	assert.Zero(t, a.Size())
 	assert.Zero(t, a.Retained(), "reserving nothing must not allocate a chunk")
+}
+
+// An allocation panic must not count storage that was never obtained. In particular,
+// recover must leave an existing batch usable without first discarding it with Reset.
+func TestArenaReserveAllocationPanic(t *testing.T) {
+	a := New[int64](64)
+	ref := a.AppendRef([]int64{42})
+	view := append(a.Reserve(1), int64(7))
+
+	require.Panics(t, func() { a.Reserve(math.MaxInt) })
+	assert.Equal(t, 16, a.Size())
+	assert.Equal(t, 64, a.Retained())
+	assert.Equal(t, []int64{42}, a.Value(ref))
+	assert.Equal(t, []int64{7}, view)
+	assert.Equal(t, []int64{9}, a.Append([]int64{9}))
+	assert.Equal(t, 24, a.Size())
+
+	a.Reset()
+	assert.Zero(t, a.Size())
+	assert.Equal(t, 64, a.Retained())
+}
+
+func TestArenaChunkAllocationPanic(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("a maximal byte chunk may be allocatable on a 32-bit target")
+	}
+	for _, store := range []struct {
+		name string
+		call func(*Arena[byte])
+	}{
+		{"Append", func(a *Arena[byte]) { a.Append([]byte{1}) }},
+		{"AppendRef", func(a *Arena[byte]) { a.AppendRef([]byte{1}) }},
+		{"Reserve", func(a *Arena[byte]) { a.Reserve(1) }},
+	} {
+		t.Run(store.name, func(t *testing.T) {
+			a := New[byte](math.MaxInt)
+			require.Panics(t, func() { store.call(a) })
+			assert.Zero(t, a.Size())
+			assert.Zero(t, a.Retained())
+		})
+	}
 }
 
 // Test_unit_Arena_ReserveCountsTowardSize pins Size as the room the batch has TAKEN
