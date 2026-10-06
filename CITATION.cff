@@ -1,0 +1,22 @@
+# No version or date-released: releases are cut automatically on every green
+# push to main, so either field would be stale by the next commit.
+cff-version: 1.2.0
+message: If you use this software, please cite it as below.
+type: software
+title: arena
+abstract: >-
+  An arena allocator for Go values whose lifetime is one batch: values are
+  packed into a few large chunks and handed back as views, so a batch is a
+  handful of heap objects rather than one per value, and pointer-free 12-byte
+  descriptors keep retained references out of the garbage collector's scan.
+authors:
+  - family-names: Lindvall
+    given-names: Johan
+repository-code: https://github.com/JohanLindvall/arena
+url: https://pkg.go.dev/github.com/JohanLindvall/arena
+license: MIT
+keywords:
+  - go
+  - arena allocator
+  - memory management
+  - garbage collection

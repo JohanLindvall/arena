@@ -21,6 +21,12 @@ a runnable `Example` in [example_test.go](example_test.go) — those are compile
 run and diffed against their `// Output:` on every CI run, so they cannot drift
 from the code the way prose does.
 
+A new `.go` file starts with `// SPDX-License-Identifier: MIT`, followed by a
+blank line so it stays out of the package doc comment.
+
+Found a vulnerability? Please do not open an issue or a pull request for it;
+report it privately as [SECURITY.md](SECURITY.md) describes.
+
 ## Releases are automatic
 
 Successful CI runs for pushes to `main` in this repository trigger

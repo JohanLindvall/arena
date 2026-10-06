@@ -1,23 +1,24 @@
 # arena
 
-[![CI](https://github.com/JohanLindvall/arena/actions/workflows/ci.yml/badge.svg)](https://github.com/JohanLindvall/arena/actions/workflows/ci.yml)
+[![CI](https://github.com/JohanLindvall/arena/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/JohanLindvall/arena/actions/workflows/ci.yml?query=branch%3Amain+event%3Apush)
 [![Go Reference](https://pkg.go.dev/badge/github.com/JohanLindvall/arena.svg)](https://pkg.go.dev/github.com/JohanLindvall/arena)
-[![Go Report Card](https://goreportcard.com/badge/github.com/JohanLindvall/arena)](https://goreportcard.com/report/github.com/JohanLindvall/arena)
+[![Release](https://img.shields.io/github/v/release/JohanLindvall/arena?sort=semver)](https://github.com/JohanLindvall/arena/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Chunk-backed storage for values whose lifetime is one batch.
-
-Values are copied in and handed back as views over the copy. Nothing is freed
-individually; the whole arena is rewound at once. That is what makes it cheap —
-storing a value is a bump within the current chunk, so a batch's worth of values
-costs a handful of chunk allocations instead of one allocation per value, and
-the collector has a handful of objects to track instead of millions.
+**arena** is an arena allocator for Go values whose lifetime is one batch — the
+strings, byte slices and rows a decoder or ingest pipeline creates by the
+million and then drops all at once. Values are packed into a few large chunks
+and handed back as ordinary `[]T` and `string` views, so a batch is a handful of
+heap objects rather than one per value, and one `Reset` rewinds the lot. To
+retain millions of them, hold `Ref`s instead: 12 pointer-free bytes each, so a
+`[]Ref` is never scanned by the garbage collector, where a `[]string` has a
+pointer in every element.
 
 ```
 go get github.com/JohanLindvall/arena
 ```
 
-Requires Go 1.24 or newer.
+Requires Go 1.24 or newer, and imports nothing outside the standard library.
 
 ## Quick start
 
@@ -38,6 +39,10 @@ for _, batch := range batches {
     a.Reset()
 }
 ```
+
+[**Run it in your browser**](https://pkg.go.dev/github.com/JohanLindvall/arena#example-package)
+— the same loop as a runnable example on pkg.go.dev, built and checked against
+its output on every CI run. Nothing to install.
 
 ## The two types
 
@@ -295,6 +300,11 @@ chunks:
 Full API documentation is on
 [pkg.go.dev](https://pkg.go.dev/github.com/JohanLindvall/arena), including
 runnable examples.
+
+## Security
+
+Report vulnerabilities privately, as [SECURITY.md](SECURITY.md) describes —
+not in a public issue.
 
 ## License
 

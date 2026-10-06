@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package arena provides chunk-backed storage for values whose lifetime is one batch.
 //
 // Values are copied in and handed back as views over the copy; nothing is freed

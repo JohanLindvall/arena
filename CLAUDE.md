@@ -13,11 +13,32 @@ That means all of these, not whichever one is nearest:
   fails the build rather than merely misleading someone
 - [README.md](README.md), including the tables — they state exact numbers and
   exact semantics, both of which go stale silently
+- [SECURITY.md](SECURITY.md), whose "What counts" lists restate the rules and the
+  documented behaviour a reporter could mistake for a bug (`Reserve` not
+  clearing, the `Ref` limits)
 - this file, when the workflow or an invariant changes
 
 Prose that contradicts the code is worse than no prose. Search before you assume
 a claim lives in one place only: `grep -rn 'oversiz\|uniform\|standalone' *.go
 README.md` is the kind of sweep that catches the copies.
+
+The pitch has copies too. It opens the README, the package doc in `arena.go`,
+the `abstract` in [CITATION.cff](CITATION.cff), and the GitHub repository
+description, which lives outside the tree (`gh repo edit --description`).
+CITATION.cff carries no `version` on purpose: releases are automatic, so one
+would be stale by the next push.
+
+The README's "Run it in your browser" link opens the package-level `Example` on
+pkg.go.dev by its `#example-package` anchor. Renaming or deleting that function
+breaks the link without failing anything, so keep it, and keep it telling the
+same story as the README's quick start.
+
+Every `.go` file opens with `// SPDX-License-Identifier: MIT` and then a blank
+line. The blank line is load-bearing in `arena.go`: without it the identifier
+joins the package doc comment, so the synopsis on pkg.go.dev reads
+"SPDX-License-Identifier: MIT Package arena provides…" — and golangci-lint stays
+quiet about it, because the `comments` exclusion preset hides revive's
+package-comment check.
 
 ## Pushing to `main` publishes a release
 
