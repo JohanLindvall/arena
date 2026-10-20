@@ -28,7 +28,7 @@ For linting, install the binary version pinned in
 [CI](.github/workflows/ci.yml). On Linux, macOS, or Git Bash on Windows:
 
 ```sh
-curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b "$(go env GOPATH)/bin" v2.13.1
+curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b "$(go env GOPATH)/bin" v2.15.0
 golangci-lint version
 ```
 
@@ -36,6 +36,12 @@ This installs into `$(go env GOPATH)/bin`; add that directory to your `PATH`.
 The command follows the
 [golangci-lint installation guide](https://golangci-lint.run/docs/welcome/install/local/)
 and uses its recommended prebuilt binaries.
+
+CI pairs this release with Go 1.27.x for linting. Use that Go minor version
+and the official linter binary when reproducing CI; check both `go version`
+and `golangci-lint version`. Rebuilding the same linter tag with a different
+Go compiler can change its compatibility. The test matrix still covers the
+minimum Go version, oldstable, and stable.
 
 ## Find your way around
 

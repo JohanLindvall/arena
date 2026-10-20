@@ -48,6 +48,11 @@ Make is optional; the commands work directly. Keep `Makefile` and
 [CI](.github/workflows/ci.yml), including the pinned linter version.
 `make help` lists formatting, coverage, fuzzing, and benchmark commands.
 
+Upgrade the lint job's Go minor version and golangci-lint as a compatible pair;
+the test matrix tracks stable independently. Validate with the official release
+binary used by CI and the lint job's Go version. Rebuilding the same linter tag
+with a different Go compiler can hide export-data incompatibilities.
+
 Run tests with the race detector because the package returns unsafe views.
 Examples must include `// Output:` so tests check their results. `go vet`
 also checks that example names resolve to real symbols.
