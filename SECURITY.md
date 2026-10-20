@@ -7,6 +7,8 @@ Report it privately, with GitHub's
 form on the repository's Security tab. Please do not open a public issue or pull
 request: the report and the fix stay private until a release carries the fix.
 
+For ordinary usage questions and non-security bugs, see [SUPPORT.md](SUPPORT.md).
+
 A useful report names the version (`go list -m github.com/JohanLindvall/arena`)
 and includes the smallest program or test that shows the problem, ideally one
 that fails under `go test -race`. If you are not sure whether something counts,

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/JohanLindvall/arena/security/advisories/new
+    about: Use private reporting for suspected memory corruption, data exposure, or other vulnerabilities.
+  - name: API documentation and runnable examples
+    url: https://pkg.go.dev/github.com/JohanLindvall/arena
+    about: Explore the API and run examples in your browser.

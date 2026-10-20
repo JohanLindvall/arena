@@ -4,6 +4,7 @@ package arena_test
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/JohanLindvall/arena"
 )
@@ -16,13 +17,11 @@ func Example() {
 	for batch := range 2 {
 		labels := make([]string, 0, 3)
 		for _, key := range []string{"container_id", "level", "namespace"} {
-			// A copy, so whatever the decoder underneath reuses its buffer for
-			// next cannot show through.
-			labels = append(labels, a.Intern(key))
+			labels = append(labels, a.Intern(key)) // copies key into the arena
 		}
 		fmt.Printf("batch %d: %v, %d bytes interned\n", batch, labels, a.Size())
 
-		// Every view above is dead from here, so the chunks can be handed out again.
+		// All uses of labels are finished before reusing their storage.
 		a.Reset()
 	}
 	// Output:
@@ -53,6 +52,18 @@ func ExampleStringArena_Intern() {
 
 	fmt.Println(first, "-", a.Retained() > 4096, "chunks were added after it")
 	// Output: still here - true chunks were added after it
+}
+
+// Copy a view before Reset when it needs to outlive the batch. Assigning the view
+// to another variable would still refer to the arena's storage.
+func ExampleStringArena_Intern_clone() {
+	var a arena.StringArena
+	view := a.Intern("keep me")
+	owned := strings.Clone(view)
+	a.Reset()
+	a.Intern("next batch")
+	fmt.Println(owned)
+	// Output: keep me
 }
 
 // Ref is the descriptor form: a chunk index and a range, with no pointer in it. A

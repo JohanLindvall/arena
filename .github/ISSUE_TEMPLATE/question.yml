@@ -1,0 +1,23 @@
+name: Usage question
+description: Get help with APIs, lifetimes, or a workload.
+labels: [question]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Questions are welcome. The [quick start](https://github.com/JohanLindvall/arena#quick-start)
+        and [API examples](https://pkg.go.dev/github.com/JohanLindvall/arena#pkg-examples)
+        may help. Please use the [private reporting form](https://github.com/JohanLindvall/arena/security/advisories/new)
+        for a suspected security vulnerability.
+  - type: textarea
+    id: question
+    attributes:
+      label: What would you like help with?
+      description: Tell us what you are building and where you got stuck.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Code and environment (optional)
+      description: A small example, arena version, and Go version help us give a useful answer.

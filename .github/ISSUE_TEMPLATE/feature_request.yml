@@ -1,0 +1,28 @@
+name: Feature or documentation request
+description: Suggest an improvement and explain the use case.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas and documentation improvements are welcome. Please search existing
+        issues first; a concrete use case helps us keep the API focused.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the workload or the part of the documentation that is unclear.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help?
+      description: Suggest an API, example, or documentation change. It is fine to be unsure.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or evidence (optional)
+      description: Include workarounds, sample code, or measurements that explain the tradeoff.

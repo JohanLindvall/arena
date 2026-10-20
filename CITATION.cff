@@ -5,10 +5,11 @@ message: If you use this software, please cite it as below.
 type: software
 title: arena
 abstract: >-
-  An arena allocator for Go values whose lifetime is one batch: values are
-  packed into a few large chunks and handed back as views, so a batch is a
-  handful of heap objects rather than one per value, and pointer-free 12-byte
-  descriptors keep retained references out of the garbage collector's scan.
+  Reusable batch storage for Go slices and strings, with 12-byte pointer-free
+  references. Values that share a lifetime are packed into reusable chunks
+  and returned as ordinary Go views. Reset reuses storage for the next batch,
+  while pointer-free descriptors keep retained references out of the garbage
+  collector's scan.
 authors:
   - family-names: Lindvall
     given-names: Johan

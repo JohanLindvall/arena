@@ -5,44 +5,97 @@
 [![Release](https://img.shields.io/github/v/release/JohanLindvall/arena?sort=semver)](https://github.com/JohanLindvall/arena/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**arena** is an arena allocator for Go values whose lifetime is one batch — the
-strings, byte slices and rows a decoder or ingest pipeline creates by the
-million and then drops all at once. Values are packed into a few large chunks
-and handed back as ordinary `[]T` and `string` views, so a batch is a handful of
-heap objects rather than one per value, and one `Reset` rewinds the lot. To
-retain millions of them, hold `Ref`s instead: 12 pointer-free bytes each, so a
-`[]Ref` is never scanned by the garbage collector, where a `[]string` has a
-pointer in every element.
+**Reusable batch storage for Go slices and strings, with 12-byte pointer-free
+references.**
 
-```
-go get github.com/JohanLindvall/arena
-```
+**arena** packs values that share a lifetime into reusable chunks. Store the
+strings, byte slices, or rows for a batch, use them as ordinary Go values, then
+call `Reset` to reuse the storage for the next batch.
 
-Requires Go 1.24 or newer, and imports nothing outside the standard library.
+- **Fewer heap objects:** allocate chunks instead of a separate backing array
+  for every value.
+- **Less reference scanning:** retain `Ref[T]` descriptors when you hold many
+  values; each is 12 bytes with no pointers for the garbage collector to scan.
+- **Fill values in place:** `Reserve` gives you writable storage with an exact
+  capacity, avoiding a copy from a temporary buffer.
+
+Go 1.24+ · usable zero value · no dependencies outside the standard library at runtime
+
+[Quick start](#quick-start) · [API guide](#storing-a-value) ·
+[Lifetime rules](#the-rules) · [Benchmarks](#benchmarks) ·
+[Contributing](CONTRIBUTING.md)
 
 ## Quick start
 
+In an existing Go module:
+
+```sh
+go get github.com/JohanLindvall/arena
+```
+
+For a scratch project, first run `mkdir arena-demo`, `cd arena-demo`, and
+`go mod init example.com/arena-demo`, then the `go get` command above.
+
+Save this as `main.go` in the scratch project:
+
 ```go
-var a arena.StringArena // the zero value is usable, with 64 KiB chunks
+package main
 
-for _, batch := range batches {
-    labels := make([]string, 0, len(batch))
-    for _, key := range batch {
-        // A copy, so whatever the decoder underneath reuses its buffer for next
-        // cannot show through.
-        labels = append(labels, a.Intern(key))
-    }
+import (
+	"fmt"
 
-    emit(labels)
+	"github.com/JohanLindvall/arena"
+)
 
-    // Every view above is dead from here, so the chunks can be handed out again.
-    a.Reset()
+func main() {
+	var a arena.StringArena // the zero value is usable, with 64 KiB chunks
+
+	for batch := range 2 {
+		labels := make([]string, 0, 3)
+		for _, key := range []string{"container_id", "level", "namespace"} {
+			labels = append(labels, a.Intern(key)) // copies key into the arena
+		}
+		fmt.Printf("batch %d: %v, %d bytes interned\n", batch, labels, a.Size())
+
+		// All uses of labels are finished before reusing their storage.
+		a.Reset()
+	}
 }
+```
+
+Run `go run .`:
+
+```text
+batch 0: [container_id level namespace], 26 bytes interned
+batch 1: [container_id level namespace], 26 bytes interned
 ```
 
 [**Run it in your browser**](https://pkg.go.dev/github.com/JohanLindvall/arena#example-package)
 — the same loop as a runnable example on pkg.go.dev, built and checked against
 its output on every CI run. Nothing to install.
+
+**All views and references expire at `Reset` or `Release`.** Finish using a
+batch before resetting, or [copy out the values you need to keep](#keeping-data-after-a-batch).
+Use one arena per worker, and follow [the four lifetime and ownership rules](#the-rules).
+
+## When to use arena
+
+Arena is useful when profiling shows allocation or GC overhead in a workload
+with a clear batch boundary: decoding records, building a columnar block, or
+processing a group of log events.
+
+| Your workload | Starting point |
+| --- | --- |
+| Strings or slices all expire together | `StringArena.Intern` or `Arena[T].Append`, then `Reset` |
+| Millions of retained references in a batch | `StrRef` or `AppendRef`, resolved through the same arena |
+| A decoder knows a value's length before filling it | `Reserve(n)` |
+| Values need independent lifetimes or individual deletion | Ordinary Go allocations |
+| You need to deduplicate equal strings | A map or an interning table; `Intern` copies every call |
+
+The library uses ordinary Go heap allocations and works with the standard Go
+toolchain. It does not require an experimental runtime or a build flag.
+Measure your workload: chunks still allocate when they grow, and `Reset`
+retains uniform chunk storage for reuse.
 
 ## The two types
 
@@ -65,7 +118,7 @@ below, is the one entry point that does not copy.)
 
 | Call | Returns | Use it when |
 | --- | --- | --- |
-| `Arena[T].Append([]T) []T` | a `[]T` view | you hold few enough views that pointers are free |
+| `Arena[T].Append([]T) []T` | a `[]T` view | you want direct slice access and hold a bounded number of views |
 | `Arena[T].AppendRef([]T) Ref[T]` | a pointer-free descriptor | you retain a great many descriptors across the batch |
 | `StringArena.Intern(string) string` | a `string` view | the value is a string and you hold a bounded number |
 | `StringArena.StrRef(string) Ref[byte]` | a pointer-free descriptor | the value is a string and you retain a great many |
@@ -256,6 +309,28 @@ chunks are noscan and the collector ignores them outright.
 Run your tests under `-race`; this package's own suite does, on every supported
 Go version, on Linux, macOS and Windows.
 
+## Keeping data after a batch
+
+Copy a value **before** `Reset` or `Release` if it must outlive the batch.
+Assigning a slice or string to another variable only copies its header; it
+still refers to arena storage.
+
+```go
+var a arena.StringArena
+view := a.Intern("keep me")
+owned := strings.Clone(view) // import "strings"; this copy has its own lifetime
+a.Reset()
+a.Intern("next batch")       // can reuse the old view's storage
+fmt.Println(owned)           // keep me
+```
+
+For slices, use `bytes.Clone` or `slices.Clone` on the view. These are shallow
+copies: pointer-bearing elements still refer to the same objects. Resolve a
+`Ref` and copy its value before resetting; copying the descriptor does not
+extend its lifetime.
+
+[Run the copy-out example](https://pkg.go.dev/github.com/JohanLindvall/arena#example-StringArena.Intern-Clone).
+
 ## Benchmarks
 
 `go test -bench=. ./...` — medians of five runs on one machine (Intel Core
@@ -295,11 +370,34 @@ chunks:
 | `int64` | 8.8 ns/op, 0 allocs |
 | `struct{int64; float64; string}` | 10.1 ns/op, 0 allocs |
 
-## Documentation
+To repeat the measurements on your machine:
+
+```sh
+go test -run='^$' -bench=. -benchmem -count=5 ./...
+```
+
+Compare changes on the same machine with interleaved runs. The benchmark
+source is in [arena_bench_test.go](arena_bench_test.go); the contributor guide
+explains [how to compare performance](CONTRIBUTING.md#performance-changes).
+
+## Help and contributing
 
 Full API documentation is on
 [pkg.go.dev](https://pkg.go.dev/github.com/JohanLindvall/arena), including
-runnable examples.
+runnable examples. For usage questions, bug reports, or ideas, start with
+[the issue chooser](https://github.com/JohanLindvall/arena/issues/new/choose).
+[SUPPORT.md](SUPPORT.md) explains what to include.
+
+Documentation improvements, small reproductions, examples, and benchmark
+comparisons are welcome. You do not need to be an allocator expert to help.
+The [contributor guide](CONTRIBUTING.md) covers setup, the source layout, and
+the checks to run before a pull request. Please follow the
+[code of conduct](CODE_OF_CONDUCT.md).
+
+Maintained by [Johan Lindvall](https://github.com/JohanLindvall) and
+[contributors](https://github.com/JohanLindvall/arena/graphs/contributors).
+If arena is useful to you, consider starring the repository and sharing it
+with someone working on a similar workload.
 
 ## Security
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-// Package arena provides chunk-backed storage for values whose lifetime is one batch.
+// Package arena provides reusable batch storage for slices and strings, with 12-byte
+// pointer-free references.
 //
 // Values are copied in and handed back as views over the copy; nothing is freed
 // individually. The whole arena is rewound at once — Reset to reuse the chunks, Release to
@@ -12,9 +13,15 @@
 // case the generic form cannot express, since a method cannot narrow its receiver's type
 // parameter: [StringArena] is an Arena[byte] with the string entry points added.
 //
+// The zero values of Arena and StringArena are ready to use with 64 KiB chunks. Use
+// [Arena.Append] or [StringArena.Intern] for direct views, [Arena.AppendRef] or
+// [StringArena.StrRef] for pointer-free references, and [Arena.Reserve] to fill a value
+// in place. Intern copies each string; it does not deduplicate equal strings.
+//
 // It is not safe for concurrent use. Every view handed out must be dead before Reset or
 // Release. Views from the copying entry points are read-only; regions from Reserve
-// may be filled by the caller.
+// may be filled by the caller. Copy values that must outlive a batch before resetting,
+// using strings.Clone, bytes.Clone, or slices.Clone as appropriate.
 package arena
 
 import "unsafe"

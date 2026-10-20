@@ -1,0 +1,42 @@
+name: Bug report
+description: Report unexpected behavior with a small reproduction.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve arena. Please search existing issues first.
+        For suspected memory corruption, data exposure, or other vulnerabilities,
+        [report privately](https://github.com/JohanLindvall/arena/security/advisories/new).
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened, and what did you expect?
+      description: Describe the behavior and its effect on your application.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Smallest reproduction
+      description: Paste a self-contained Go program or test, plus the command to run it.
+      render: go
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Version and environment
+      description: |
+        Include the output of `go version`, `go env GOOS GOARCH`, and
+        `go list -m github.com/JohanLindvall/arena` from your application.
+        For an arena checkout, use `git rev-parse HEAD` for the version.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Logs or benchmark results (optional)
+      description: Include relevant output; remove credentials and private data.
+      render: text
