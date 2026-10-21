@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-// Package arena provides reusable batch storage for slices and strings, with 12-byte
-// pointer-free references.
+// Package arena provides reusable batch storage for slices and strings, reducing
+// allocation and GC scanning overhead with 12-byte pointer-free references.
 //
 // Values are copied in and handed back as views over the copy; nothing is freed
 // individually. The whole arena is rewound at once — Reset to reuse the chunks, Release to
@@ -9,14 +9,22 @@
 // and a batch's worth of values costs a handful of chunk allocations rather than one per
 // value.
 //
+// Holding millions of strings can also consume CPU on every GC cycle, even when the
+// collection is no longer growing. Store them with [StringArena.AppendStringRef], retain a
+// []Ref[byte], and resolve views with [StringArena.StringValue] as needed to remove per-string
+// pointer scanning. The descriptor array and byte chunks contain no pointers; the arena's
+// chunk headers and any live string views still need scanning. Keeping
+// [StringArena.AppendString] results in a []string retains a pointer per value and does not
+// remove that scan work.
+//
 // Arena is generic in its element type, so it stores slices of any T. Strings are the one
 // case the generic form cannot express, since a method cannot narrow its receiver's type
 // parameter: [StringArena] is an Arena[byte] with the string entry points added.
 //
 // The zero values of Arena and StringArena are ready to use with 64 KiB chunks. Use
-// [Arena.Append] or [StringArena.Intern] for direct views, [Arena.AppendRef] or
-// [StringArena.StrRef] for pointer-free references, and [Arena.Reserve] to fill a value
-// in place. Intern copies each string; it does not deduplicate equal strings.
+// [Arena.Append] or [StringArena.AppendString] for direct views, [Arena.AppendRef] or
+// [StringArena.AppendStringRef] for pointer-free references, and [Arena.Reserve] to fill a value
+// in place. AppendString copies each string; it does not deduplicate equal strings.
 //
 // It is not safe for concurrent use. Every view handed out must be dead before Reset or
 // Release. Views from the copying entry points are read-only; regions from Reserve
@@ -31,7 +39,7 @@ import "unsafe"
 // whatever T is, instead of scaling with the width of T behind the caller's back.
 //
 // New overrides it: a columnar block accumulator wants 1 MiB chunks, where a caller
-// interning short label strings is better served by the 64 KiB default.
+// storing short label strings is better served by the 64 KiB default.
 const defaultChunkBytes = 1 << 16
 
 // maxRefIndex is the largest offset or chunk index a Ref can hold, since it stores them as
@@ -60,11 +68,12 @@ func chunkElems[T any](chunkBytes int) int {
 // its own instead, which Reset drops rather than recycling, so a single huge value cannot
 // leave an oversized chunk sitting in the reusable set for the arena's lifetime.
 //
-// What the arena saves is object count, not scan work: for a T that contains pointers the
-// chunks are still scanned, they are simply a handful of large objects rather than one per
-// value. For a pointer-free T the chunks are noscan and the collector ignores them
-// outright. Reset does not clear reused chunks, so pointers in them keep their targets
-// alive until overwritten or the chunks are released. Copies of T are shallow.
+// For a T that contains pointers, chunking reduces object count, but the collector still
+// scans the pointers in the stored elements. For a pointer-free T, the chunk contents need
+// no pointer scanning. Retaining Ref[T] descriptors also removes the per-value pointers
+// from the descriptor slice, regardless of T; it does not remove pointers inside T itself.
+// Reset does not clear reused chunks, so pointers in them keep their targets alive until
+// overwritten or the chunks are released. Copies of T are shallow.
 type Arena[T any] struct {
 	chunks [][]T
 	idx    int // index of the chunk currently being filled
@@ -248,13 +257,14 @@ func (a *Arena[T]) Reserve(n int) []T {
 // type.
 //
 // The pointer-free part is the point, and it is worth the extra indirection on every read.
-// A []Ref is allocated noscan, so the GC never walks it and a sort never pays a write
-// barrier moving one; the []T form that Append returns puts a pointer in every element,
-// and a caller holding millions of them turns its largest structure into scan work on every
-// cycle. Measured on a production ingest service: the []byte form put
-// runtime.gcBgMarkWorker at 11.1% of the process against 0.5% elsewhere in the tree. It is
-// also 12 bytes against a slice header's 24, which for a caller that retains descriptors is
-// the same saving twice over. Both hold whatever T is, pointer-bearing ones included.
+// A []Ref backing array is allocated noscan, so the GC skips its contents during pointer
+// scanning and a sort never pays a write barrier moving one. A [][]T of Append views or
+// a []string of AppendString views contains a pointer per value; holding millions of these
+// views adds scan work and CPU load on every GC cycle. Measured on a production ingest
+// service, the []byte view form put runtime.gcBgMarkWorker at 11.1% of the process against 0.5%
+// elsewhere in the tree. A Ref is also 12 bytes against a slice header's 24, reducing space
+// for retained descriptors as well as scan work. Both hold whatever T is, pointer-bearing
+// ones included.
 //
 // The zero Ref is the ABSENT value: a stored value is never zero elements long (AppendRef
 // returns the zero Ref for empty input), so end <= off cannot name a real one.
@@ -267,8 +277,8 @@ func (a *Arena[T]) Reserve(n int) []T {
 // Three int32s are what makes a Ref small, and they are also what bounds it. The bound is
 // 2^31-1 ELEMENTS rather than bytes, so it scales with the width of T: 2 GiB for an
 // Arena[byte], but 16 GiB for an Arena[int64]. Two things can reach it — a single value
-// stored through AppendRef or StrRef, and an arena that New was given a chunk that wide.
-// A third, 2^31 chunks at once, is out of reach at any sane chunk size.
+// stored through AppendRef or AppendStringRef, and an arena that New was given a chunk that
+// wide. A third, 2^31 chunks at once, is out of reach at any sane chunk size.
 //
 // AppendRef panics rather than let the conversion wrap, so crossing the bound is loud. It
 // is worth knowing what the panic prevents: a length in [2^31, 2^32) wraps end negative,
@@ -276,9 +286,9 @@ func (a *Arena[T]) Reserve(n int) []T {
 // nothing said; a length at or past 2^32 wraps to a small positive number, which Value
 // would resolve to a truncated prefix.
 //
-// Append and Intern carry no such limit. They hand back a slice or a string header, neither
-// of which holds an int32 — the bound belongs to the descriptor, not to the arena — so they
-// are what to reach for when a value could approach it.
+// Append and AppendString carry no such limit. They hand back a slice or a string header,
+// neither of which holds an int32 — the bound belongs to the descriptor, not to the arena
+// — so they are what to reach for when a value could approach it.
 type Ref[T any] struct {
 	chunk    int32
 	off, end int32

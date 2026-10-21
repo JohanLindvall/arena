@@ -35,8 +35,8 @@ soundness is a security property. In a program that follows
 
 - a view or `Ref` that reaches outside the value it was handed out for — into
   another live value, or into memory the arena does not own;
-- a string from `Intern` or `Str` whose bytes change before the next `Reset` or
-  `Release`;
+- a string from `AppendString` or `StringValue` whose bytes change before the
+  next `Reset` or `Release`;
 - memory corruption or a data race that originates in the package itself.
 
 These are documented behaviour, not vulnerabilities:
@@ -47,5 +47,5 @@ These are documented behaviour, not vulnerabilities:
   them, by design;
 - a region from `Reserve` that holds a previous batch's data. `Reset` does not
   clear chunks, and `Reserve` does not clear what it hands back;
-- `AppendRef` and `StrRef` panicking on a value stored beyond what a `Ref` can
-  describe; see [what a `Ref` can address](README.md#what-a-ref-can-address).
+- `AppendRef` and `AppendStringRef` panicking on a value stored beyond what a
+  `Ref` can describe; see [what a `Ref` can address](README.md#what-a-ref-can-address).

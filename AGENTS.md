@@ -91,7 +91,8 @@ and verify that the rules still match the intended findings.
   `isOversized` relies on that distinction so `Reset` can drop oversized chunks.
   Preserve the `Retained` assertions for both copying and reservation paths.
 - **Keep placement policy in `place`.** `Append` and `AppendRef` pass a source;
-  `Reserve` passes nil and a count. `Intern` and `StrRef` use those same paths.
+  `Reserve` passes nil and a count. `AppendString` and `AppendStringRef` use
+  those same paths.
   `place` returns the region in the shape each caller needs.
 - **Cap reservations at exactly `n`.** Use a three-index slice with length zero
   so overfilling reallocates instead of overwriting neighboring values.
@@ -128,9 +129,9 @@ The README reports medians of five runs. Include the CPU, OS, Go version, and
 commands when updating measurements.
 
 - Alternate baseline and changed runs on the same machine to reduce drift.
-  Use unchanged clone arms in `BenchmarkIntern` as a within-run baseline.
+  Use unchanged clone arms in `BenchmarkAppendString` as a within-run baseline.
   `BenchmarkAppendRef` compares both storage paths in one run.
-- Treat `BenchmarkIntern/arena/4096` as variable. Its 16 MiB batch spans 256
+- Treat `BenchmarkAppendString/arena/4096` as variable. Its 16 MiB batch spans 256
   default chunks; only the first batch allocates them, and later batches reuse
   them. Preserve that qualification when reporting results.
 - Bound live bytes in benchmarks that retain batches. Oversized values occupy

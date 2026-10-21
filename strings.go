@@ -13,11 +13,17 @@ import "unsafe"
 // wants the plain arena. The zero value is usable, with 64 KiB chunks. Like Arena,
 // StringArena must not be copied after first use and is not safe for concurrent use.
 //
-// There are two ways to hold what it stores, matching the two on Arena. Intern hands back a
-// string view, which is what a caller with a bounded number of live values wants; StrRef
-// hands back a pointer-free descriptor that Str resolves, which is what a caller retaining
-// a great many of them wants — a []Ref[byte] is 12 bytes per element and noscan, where a
-// []string is 16 with a pointer in every one.
+// There are two ways to hold what it stores, matching the two on Arena. AppendString
+// hands back a string view, for a caller with a bounded number of live values.
+// AppendStringRef hands back a pointer-free descriptor that StringValue resolves, for a
+// caller retaining many values: a []Ref[byte] is 12 bytes per element and noscan, where a
+// []string is 16 with a pointer in every element.
+//
+// Holding millions of strings as AppendStringRef descriptors reduces GC CPU load by removing
+// per-string pointer scanning on every cycle. Neither the descriptor array nor the byte
+// chunk contents need scanning; the arena's chunk headers and any live string views still
+// do. Retain descriptors and resolve with StringValue as needed: keeping AppendString
+// results or all resolved views in a []string preserves the per-string scan work.
 type StringArena struct {
 	Arena[byte]
 }
@@ -40,36 +46,42 @@ func s2b(s string) []byte {
 	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
-// Intern copies s into the arena and returns a stable string view over the copy. A string
-// larger than a whole chunk gets a chunk of its own, which Reset drops rather than
+// AppendString copies s into the arena and returns a stable string view over the copy.
+// A string larger than a whole chunk gets a chunk of its own, which Reset drops rather than
 // recycling — see [Arena.Append]. Each call copies its input; equal strings are not
 // deduplicated. The empty string stores nothing and returns "".
-func (a *StringArena) Intern(s string) string {
+//
+// Retaining the results in a []string still requires per-string GC scanning; use
+// [StringArena.AppendStringRef] to avoid that CPU cost when holding many strings.
+func (a *StringArena) AppendString(s string) string {
 	if len(s) == 0 {
 		return ""
 	}
 	return b2s(a.Append(s2b(s)))
 }
 
-// StrRef copies s into the arena and returns a pointer-free descriptor for the copy — the
-// string counterpart of AppendRef, resolved by Str. Reach for it over Intern when the batch
-// retains enough strings for the descriptors themselves to matter (see [Ref]).
+// AppendStringRef copies s into the arena and returns a pointer-free descriptor for the
+// copy — the string counterpart of AppendRef, resolved by StringValue. Use it when the
+// batch retains many strings and GC scanning contributes to CPU load (see [Ref]). Retain
+// the descriptors in a []Ref[byte] and resolve strings only as needed to avoid per-string
+// scanning.
 //
-// The empty string gives the zero Ref, which Str resolves back to "".
+// The empty string gives the zero Ref, which StringValue resolves back to "".
 //
 // Like AppendRef, it panics if the stored range or chunk index exceeds the limits of
 // [Ref], including strings of 2 GiB or more. The check follows the copy, so a recovered
-// panic leaves the value stored but undescribed. Intern has no such limit.
-func (a *StringArena) StrRef(s string) Ref[byte] {
+// panic leaves the value stored but undescribed. AppendString has no such limit.
+func (a *StringArena) AppendStringRef(s string) Ref[byte] {
 	if len(s) == 0 {
 		return Ref[byte]{}
 	}
 	return a.AppendRef(s2b(s))
 }
 
-// Str resolves r to a string view over the arena's copy — the string counterpart of Value.
+// StringValue resolves r to a string view over the arena's copy — the string counterpart
+// of Value.
 // The absent descriptor resolves to the empty string. A nonempty r must belong to this
 // arena's current batch; see [Ref]. The view stays valid until Reset or Release.
-func (a *StringArena) Str(r Ref[byte]) string {
+func (a *StringArena) StringValue(r Ref[byte]) string {
 	return b2s(a.Value(r))
 }

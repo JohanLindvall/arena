@@ -15,11 +15,11 @@ import (
 // a value that dies immediately would be stack-allocated and prove nothing.
 const batch = 4096
 
-// BenchmarkIntern measures the arena against the obvious alternative, one heap-allocated
+// BenchmarkAppendString measures the arena against the obvious alternative, one heap-allocated
 // copy per value, with both sides holding a batch live. The arena spends one allocation
 // per chunk where the baseline spends one per value, so allocs/op is as much the point
 // as ns/op.
-func BenchmarkIntern(b *testing.B) {
+func BenchmarkAppendString(b *testing.B) {
 	for _, size := range []int{16, 256, 4096} {
 		value := strings.Repeat("x", size)
 
@@ -32,7 +32,7 @@ func BenchmarkIntern(b *testing.B) {
 					kept = kept[:0] // every view is dead here, so the chunks can be reused
 					a.Reset()
 				}
-				kept = append(kept, a.Intern(value))
+				kept = append(kept, a.AppendString(value))
 			}
 			runtime.KeepAlive(kept)
 		})
@@ -113,11 +113,12 @@ func BenchmarkAppendRef(b *testing.B) {
 }
 
 // BenchmarkRetainedDescriptorGC is the reason Ref exists. It holds a batch's worth of
-// descriptors live and times a full GC cycle over each form: []byte puts a pointer in
-// every element, so the collector walks the whole slice on every cycle, where []Ref is
-// allocated noscan and is skipped outright.
+// descriptors live and times a full GC cycle over each form: [][]byte and []string put
+// a pointer in every element, so the collector scans the backing array on every cycle.
+// A []Ref backing array is allocated noscan and needs no pointer scanning.
 //
-// Both variants retain the same arena bytes. Only the descriptor slice differs.
+// All variants retain the same arena bytes. Only the descriptor slice differs. The
+// benchmark reports elapsed GC cycle time, not total application CPU usage.
 func BenchmarkRetainedDescriptorGC(b *testing.B) {
 	const n = 1 << 20 // descriptors a large batch might carry
 	value := []byte(`{"ts":1755000000,"level":"info"}`)
@@ -152,7 +153,7 @@ func BenchmarkRetainedDescriptorGC(b *testing.B) {
 		a := NewStringArena(defaultChunkBytes)
 		views := make([]string, n)
 		for i := range views {
-			views[i] = a.Intern(string(value))
+			views[i] = a.AppendString(string(value))
 		}
 		for b.Loop() {
 			runtime.GC()

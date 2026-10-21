@@ -5,8 +5,8 @@
 [![Release](https://img.shields.io/github/v/release/JohanLindvall/arena?sort=semver)](https://github.com/JohanLindvall/arena/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Reusable batch storage for Go slices and strings, with 12-byte pointer-free
-references.**
+**Reusable batch storage for Go slices and strings, reducing allocation and GC
+scanning overhead with 12-byte pointer-free references.**
 
 **arena** packs values that share a lifetime into reusable chunks. Store the
 strings, byte slices, or rows for a batch, use them as ordinary Go values, then
@@ -14,8 +14,10 @@ call `Reset` to reuse the storage for the next batch.
 
 - **Fewer heap objects:** allocate chunks instead of a separate backing array
   for every value.
-- **Less reference scanning:** retain `Ref[T]` descriptors when you hold many
-  values; each is 12 bytes with no pointers for the garbage collector to scan.
+- **Lower GC CPU load when holding millions of strings:** retain the `Ref[byte]`
+  descriptors returned by `AppendStringRef` and resolve them with `StringValue`
+  as needed. The collector skips their backing array during pointer scanning,
+  avoiding the per-string scan work of a live `[]string` on every GC cycle.
 - **Fill values in place:** `Reserve` gives you writable storage with an exact
   capacity, avoiding a copy from a temporary buffer.
 
@@ -53,9 +55,9 @@ func main() {
 	for batch := range 2 {
 		labels := make([]string, 0, 3)
 		for _, key := range []string{"container_id", "level", "namespace"} {
-			labels = append(labels, a.Intern(key)) // copies key into the arena
+			labels = append(labels, a.AppendString(key)) // copies key into the arena
 		}
-		fmt.Printf("batch %d: %v, %d bytes interned\n", batch, labels, a.Size())
+		fmt.Printf("batch %d: %v, %d bytes stored\n", batch, labels, a.Size())
 
 		// All uses of labels are finished before reusing their storage.
 		a.Reset()
@@ -66,8 +68,8 @@ func main() {
 Run `go run .`:
 
 ```text
-batch 0: [container_id level namespace], 26 bytes interned
-batch 1: [container_id level namespace], 26 bytes interned
+batch 0: [container_id level namespace], 26 bytes stored
+batch 1: [container_id level namespace], 26 bytes stored
 ```
 
 [**Run it in your browser**](https://pkg.go.dev/github.com/JohanLindvall/arena#example-package)
@@ -84,13 +86,20 @@ Arena is useful when profiling shows allocation or GC overhead in a workload
 with a clear batch boundary: decoding records, building a columnar block, or
 processing a group of log events.
 
+Holding millions of strings can consume GC CPU time even when the collection
+is no longer growing: each GC cycle still scans the pointers in its string
+headers. `AppendStringRef` lets you keep those values as pointer-free
+descriptors for the batch, removing that per-string scanning work. This
+addresses the cost of keeping values live as well as the cost of allocating them.
+
 | Your workload | Starting point |
 | --- | --- |
-| Strings or slices all expire together | `StringArena.Intern` or `Arena[T].Append`, then `Reset` |
-| Millions of retained references in a batch | `StrRef` or `AppendRef`, resolved through the same arena |
+| Strings or slices all expire together | `StringArena.AppendString` or `Arena[T].Append`, then `Reset` |
+| GC CPU load from millions of retained strings in a batch | `AppendStringRef`, retain `[]Ref[byte]`, and resolve with `StringValue` as needed |
+| Millions of retained slice references in a batch | `AppendRef`, resolved with `Value` through the same arena |
 | A decoder knows a value's length before filling it | `Reserve(n)` |
 | Values need independent lifetimes or individual deletion | Ordinary Go allocations |
-| You need to deduplicate equal strings | A map or an interning table; `Intern` copies every call |
+| You need to deduplicate equal strings | A map or an interning table; `AppendString` copies every call |
 
 The library uses ordinary Go heap allocations and works with the standard Go
 toolchain. It does not require an experimental runtime or a build flag.
@@ -101,13 +110,13 @@ retains uniform chunk storage for reuse.
 
 `Arena[T]` stores slices of any `T`. `StringArena` is an `Arena[byte]` with the
 string entry points added — it exists because a method cannot narrow its
-receiver's type parameter, so `Intern` cannot live on `Arena` itself. Everything
-`Arena[byte]` does is promoted onto it, and the embedded field is addressable as
-`a.Arena` for code that wants the plain arena.
+receiver's type parameter, so `AppendString` cannot live on `Arena` itself.
+Everything `Arena[byte]` does is promoted onto it, and the embedded field is
+addressable as `a.Arena` for code that wants the plain arena.
 
 ```go
 a := arena.New[Sample](1 << 20)   // 1 MiB chunks of Sample
-s := arena.NewStringArena(4096)   // 4 KiB chunks, plus Intern/StrRef/Str
+s := arena.NewStringArena(4096)   // 4 KiB chunks, with string entry points
 f := arena.Make[float64](4096)    // the same, as a value rather than a pointer
 ```
 
@@ -120,16 +129,17 @@ below, is the one entry point that does not copy.)
 | --- | --- | --- |
 | `Arena[T].Append([]T) []T` | a `[]T` view | you want direct slice access and hold a bounded number of views |
 | `Arena[T].AppendRef([]T) Ref[T]` | a pointer-free descriptor | you retain a great many descriptors across the batch |
-| `StringArena.Intern(string) string` | a `string` view | the value is a string and you hold a bounded number |
-| `StringArena.StrRef(string) Ref[byte]` | a pointer-free descriptor | the value is a string and you retain a great many |
+| `StringArena.AppendString(string) string` | a `string` view | the value is a string and you hold a bounded number |
+| `StringArena.AppendStringRef(string) Ref[byte]` | a pointer-free descriptor | you retain many strings and want to reduce GC scanning CPU cost |
 
-`Value` resolves a `Ref[T]` back to a `[]T`; `Str` resolves one back to a
+`Value` resolves a `Ref[T]` back to a `[]T`; `StringValue` resolves one back to a
 `string`. They are the same descriptor, so the byte and string sides
 interoperate freely. All four store through one path, so they agree on
 everything except what they hand back.
 
 Copies are shallow: pointer-bearing elements still refer to the original objects.
-`Intern` copies each string on every call; it does not deduplicate equal strings.
+`AppendString` copies each string on every call; it does not deduplicate equal
+strings.
 
 Every view is **one contiguous slice**. A value that does not fit the current
 chunk starts a new chunk rather than being split, so nothing has to be
@@ -138,6 +148,19 @@ reassembled on the way out.
 Views stay valid until the next `Reset` or `Release`. Chunks are never
 reallocated once allocated, so storing more values never invalidates a view
 handed out earlier.
+
+### Updating existing callers
+
+The string methods have been renamed to describe their operations:
+
+| Previous name | Current name |
+| --- | --- |
+| `Intern` | `AppendString` |
+| `StrRef` | `AppendStringRef` |
+| `Str` | `StringValue` |
+
+Update calls and method references to the new names. Storage and lifetime
+behavior is the same.
 
 ### Building a value in place
 
@@ -182,42 +205,53 @@ p = p[:n]                       // safe to read all n elements, including unwrit
 ```go
 refs := make([]arena.Ref[byte], 0, len(lines))
 for _, line := range lines {
-    refs = append(refs, a.StrRef(line))
+    refs = append(refs, a.AppendStringRef(line))
 }
 ...
 for _, r := range refs {
     if !r.Empty() {
-        w.WriteString(a.Str(r))
+        w.WriteString(a.StringValue(r))
     }
 }
 ```
 
 The extra indirection on every read buys two things. A `[]Ref[T]` holds no
-pointers, so it is allocated noscan and the garbage collector skips it entirely
+pointers, so its backing array is allocated noscan and skipped during GC scanning
 — where a `[][]byte` or `[]string` puts a pointer in every element and is walked
 on every cycle. And a `Ref` is 12 bytes against a string header's 16 or a slice
 header's 24, which for a caller that retains descriptors is the same saving
 twice over. Both hold whatever `T` is: `Ref[T]` is 12 pointer-free bytes even
 when `T` itself is full of pointers.
 
+For `StringArena`, the byte chunks also contain no pointers. The collector
+still scans the arena's chunk headers and any live string views, but retaining
+`[]Ref[byte]` removes the pointer per stored string. Keeping `AppendString`
+results in a `[]string` does not remove that scan work; neither does keeping
+all the original input strings or the views returned by `StringValue`.
+Retain descriptors and resolve views only as needed. The Go GC guide explains how
+[pointers in the live heap contribute to GC CPU cost](https://go.dev/doc/gc-guide#Understanding_costs).
+
 The type parameter is a phantom — it carries no field, and is there so a `Ref`
 cannot be resolved against an arena of some other element type.
 
-The zero `Ref` is the absent value: `AppendRef` and `StrRef` return it for empty
-input, `Empty` reports it, `Value` resolves it to `nil` and `Str` to `""`.
+The zero `Ref` is the absent value: `AppendRef` and `AppendStringRef` return it
+for empty input, `Empty` reports it, `Value` resolves it to `nil` and
+`StringValue` to `""`.
 
 ### What a `Ref` can address
 
 Three `int32`s are what make a `Ref` small, and also what bound it. The bound is
 2³¹−1 **elements**, not bytes, so it scales with the width of `T` — 2 GiB for an
 `Arena[byte]`, 16 GiB for an `Arena[int64]`. Two things can reach it: a single
-value stored through `AppendRef`/`StrRef`, and an arena `New` was given a chunk
-that wide. A third, 2³¹ chunks at once, is out of reach at any sane chunk size.
+value stored through `AppendRef`/`AppendStringRef`, and an arena `New` was given
+a chunk that wide. A third, 2³¹ chunks at once, is out of reach at any sane
+chunk size.
 
-**`AppendRef` and `StrRef` panic rather than let the conversion wrap**, so crossing the bound
-is loud. The check measures free: the uniform store path already caps the offset
-at the chunk's own capacity, so only an oversized value or an over-wide chunk can
-get near it, and the branch is never taken in ordinary use.
+**`AppendRef` and `AppendStringRef` panic rather than let the conversion wrap**,
+so crossing the bound is loud. The check measures free: the uniform store path
+already caps the offset at the chunk's own capacity, so only an oversized
+value or an over-wide chunk can get near it, and the branch is never taken
+in ordinary use.
 
 The check happens after storing the value. Recovering the panic leaves that
 value counted in `Size` until the next rewind.
@@ -227,7 +261,7 @@ and 2³² wraps `end` negative, so `Empty` reports the value **absent** and `Val
 returns `nil` — the value is gone with nothing said. Past 2³² it wraps to a small
 positive number and `Value` returns a **truncated prefix**.
 
-`Append` and `Intern` carry no such limit — a slice or string header holds no
+`Append` and `AppendString` carry no such limit — a slice or string header holds no
 `int32`. The bound belongs to the descriptor, not to the arena, so they are what
 to reach for when a value could approach it.
 
@@ -272,7 +306,7 @@ sane for a 64-byte struct instead of quietly becoming 4 MiB.
 
 Chunk size decides the tail waste: a value that does not fit the current chunk
 starts a new one and strands the remainder, so size the chunk to the values.
-Interning short strings is comfortable at the default; accumulating large rows
+Storing short strings is comfortable at the default; accumulating large rows
 or blocks wants something closer to 1 MiB.
 
 A value larger than a whole chunk gets a chunk of its own, sized to fit it
@@ -295,16 +329,18 @@ The caller must observe these rules:
    or panic.
 3. **Views from `Append` and `Value` are read-only.** Do not modify or append to
    them: their capacity can extend into neighbouring values, including bytes
-   exposed as immutable strings by `Intern` and `Str`. `Reserve` is the explicit
-   exception: its region is yours to fill, with capacity limited to its size.
+   exposed as immutable strings by `AppendString` and `StringValue`. `Reserve`
+   is the explicit exception: its region is yours to fill, with capacity limited
+   to its size.
 4. **Do not copy an arena after first use.** This includes `StringArena` and
    structs containing either type. Copies share storage but track placement
    independently, so they can overwrite each other's values. Pass a pointer.
 
-What the arena saves is object *count*, not scan work: for a `T` that contains
-pointers the chunks are still scanned, they are simply a handful of large
-objects rather than one per value. For a pointer-free `T` — bytes included — the
-chunks are noscan and the collector ignores them outright.
+For a `T` that contains pointers, chunking reduces object *count*, but the
+collector still scans the pointers in the stored elements. For a pointer-free
+`T` — bytes included — the chunk contents need no pointer scanning. Retaining
+`Ref[T]` descriptors also removes the per-value pointers from the descriptor
+slice, regardless of `T`; it does not remove pointers inside `T` itself.
 
 Run your tests under `-race`; this package's own suite does, on every supported
 Go version, on Linux, macOS and Windows.
@@ -317,10 +353,10 @@ still refers to arena storage.
 
 ```go
 var a arena.StringArena
-view := a.Intern("keep me")
+view := a.AppendString("keep me")
 owned := strings.Clone(view) // import "strings"; this copy has its own lifetime
 a.Reset()
-a.Intern("next batch")       // can reuse the old view's storage
+a.AppendString("next batch") // can reuse the old view's storage
 fmt.Println(owned)           // keep me
 ```
 
@@ -329,18 +365,18 @@ copies: pointer-bearing elements still refer to the same objects. Resolve a
 `Ref` and copy its value before resetting; copying the descriptor does not
 extend its lifetime.
 
-[Run the copy-out example](https://pkg.go.dev/github.com/JohanLindvall/arena#example-StringArena.Intern-Clone).
+[Run the copy-out example](https://pkg.go.dev/github.com/JohanLindvall/arena#example-StringArena.AppendString-Clone).
 
 ## Benchmarks
 
 `go test -bench=. ./...` — medians of five runs on one machine (Intel Core
 Ultra 9 185H, Go 1.26, linux/amd64). Indicative, not a promise.
 
-Interning against the obvious alternative, one heap-allocated copy per value,
+Storing against the obvious alternative, one heap-allocated copy per value,
 with both sides holding a batch of 4096 live — a copy that dies immediately gets
 stack-allocated and proves nothing:
 
-| Value | `StringArena.Intern` | One heap copy per value |
+| Value | `StringArena.AppendString` | One heap copy per value |
 | --- | --- | --- |
 | 16 B | 6.6 ns/op, 0 allocs | 15.5 ns/op, 1 alloc |
 | 256 B | 8.9 ns/op, 0 allocs | 60.1 ns/op, 1 alloc |
@@ -350,15 +386,19 @@ The 4 KiB row moves by tens of percent between runs; the two smaller ones are
 stable to a few percent. That batch occupies 16 MiB across 256 default chunks.
 The first batch allocates them; subsequent batches reuse them through `Reset`.
 
-The collector is the other half of the story. Holding 2²⁰ descriptors live and
-timing one full GC cycle over each form — same bytes in the arena either way,
-only the descriptor slice differs:
+The collector is the other half of the story. Holding 2²⁰ (1,048,576)
+descriptors live and timing one full GC cycle over each form — same bytes in
+the arena either way, only the descriptor slice differs. This isolates the
+cost of retaining references after the values have already been stored:
 
-| Descriptors retained | Width | GC cycle |
+| Descriptors retained | Width | GC cycle elapsed time |
 | --- | --- | --- |
 | `[]Ref[byte]` | 12 B, noscan | **254 µs** |
 | `[][]byte` | 24 B, scanned | 2081 µs |
 | `[]string` | 16 B, scanned | 2393 µs |
+
+These are elapsed times for forced GC cycles, not measurements of total
+application CPU usage; profile your workload to measure its CPU savings.
 
 The element type costs nothing. Storing 256 bytes per call through arenas of
 different `T`, where the struct case also carries a pointer and so has scanned

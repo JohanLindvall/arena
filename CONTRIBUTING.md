@@ -121,8 +121,8 @@ go test -run='^$' -bench=. -benchmem -count=5 ./...
 ```
 
 Include the CPU, OS, Go version, commands, and results in the pull request.
-Compare the unchanged clone arms of `BenchmarkIntern` within each run;
-`BenchmarkIntern/arena/4096` is particularly variable. The CI benchmark step
+Compare the unchanged clone arms of `BenchmarkAppendString` within each run;
+`BenchmarkAppendString/arena/4096` is particularly variable. The CI benchmark step
 runs one iteration to catch broken benchmarks, not to measure performance.
 
 Read the [performance notes](AGENTS.md#performance-sensitive-code) before

@@ -14,48 +14,48 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestArenaInternBasic checks that Intern round-trips small strings and that the
+// TestArenaAppendStringBasic checks that AppendString round-trips small strings and that the
 // empty string is never chunk-backed.
-func TestArenaInternBasic(t *testing.T) {
+func TestArenaAppendStringBasic(t *testing.T) {
 	var a StringArena
 	for _, s := range []string{"", "a", "container_id", "level"} {
-		if got := a.Intern(s); got != s {
-			t.Errorf("Intern(%q) = %q, want %q", s, got, s)
+		if got := a.AppendString(s); got != s {
+			t.Errorf("AppendString(%q) = %q, want %q", s, got, s)
 		}
 	}
 }
 
-// TestArenaInternCopies verifies an interned view is a copy: mutating the source
-// bytes after interning must not change the returned string.
-func TestArenaInternCopies(t *testing.T) {
+// TestArenaAppendStringCopies verifies a stored view is a copy: mutating the source
+// bytes after storing must not change the returned string.
+func TestArenaAppendStringCopies(t *testing.T) {
 	var a StringArena
 	src := []byte("hello")
-	// Share the input string with src so this tests Intern's copy, not the copy
+	// Share the input string with src so this tests AppendString's copy, not the copy
 	// that an ordinary string(src) conversion would already have made.
-	got := a.Intern(b2s(src))
+	got := a.AppendString(b2s(src))
 	for i := range src {
 		src[i] = 'x'
 	}
 	if got != "hello" {
-		t.Errorf("interned value changed with source mutation: got %q", got)
+		t.Errorf("stored value changed with source mutation: got %q", got)
 	}
 }
 
 // TestArenaOversizeAndStability verifies the arena handles strings longer than
-// defaultChunkBytes and that strings interned earlier stay byte-identical after later
-// interns force new chunks (i.e. no chunk is ever reallocated under a live view).
+// defaultChunkBytes and that strings stored earlier stay byte-identical after later
+// stores force new chunks (i.e. no chunk is ever reallocated under a live view).
 // It also checks that Reset lets the arena be reused.
 func TestArenaOversizeAndStability(t *testing.T) {
 	var a StringArena
 
 	// A string well past a single chunk must round-trip intact.
 	big := strings.Repeat("x", defaultChunkBytes*2+123)
-	if got := a.Intern(big); got != big {
-		t.Fatalf("oversize Intern round-trip failed (len got %d want %d)", len(got), len(big))
+	if got := a.AppendString(big); got != big {
+		t.Fatalf("oversize AppendString round-trip failed (len got %d want %d)", len(got), len(big))
 	}
 
-	// Intern many strings (small and oversized) and keep every returned view; once
-	// all are interned, each must still equal its source. If any chunk had been
+	// Store many strings (small and oversized) and keep every returned view; once
+	// all are stored, each must still equal its source. If any chunk had been
 	// reallocated to grow, an earlier view would now read garbage.
 	inputs := make([]string, 0, 5004)
 	inputs = append(inputs, "", "a", "container_id", strings.Repeat("y", defaultChunkBytes+1))
@@ -64,36 +64,36 @@ func TestArenaOversizeAndStability(t *testing.T) {
 	}
 	got := make([]string, len(inputs))
 	for i, s := range inputs {
-		got[i] = a.Intern(s)
+		got[i] = a.AppendString(s)
 	}
 	for i, s := range inputs {
 		if got[i] != s {
-			t.Errorf("interned string %d changed (len got %d want %d)", i, len(got[i]), len(s))
+			t.Errorf("stored string %d changed (len got %d want %d)", i, len(got[i]), len(s))
 		}
 	}
 	// The empty string is never backed by a chunk.
-	if got := a.Intern(""); got != "" {
-		t.Errorf(`Intern("") = %q, want ""`, got)
+	if got := a.AppendString(""); got != "" {
+		t.Errorf(`AppendString("") = %q, want ""`, got)
 	}
 
 	// After Reset the arena is reusable and still correct (chunks are rewound, not
 	// dropped).
 	a.Reset()
-	if got := a.Intern(big); got != big {
-		t.Errorf("after Reset, oversize Intern round-trip failed")
+	if got := a.AppendString(big); got != big {
+		t.Errorf("after Reset, oversize AppendString round-trip failed")
 	}
-	if got := a.Intern("hello"); got != "hello" {
-		t.Errorf("after Reset, Intern(hello) = %q", got)
+	if got := a.AppendString("hello"); got != "hello" {
+		t.Errorf("after Reset, AppendString(hello) = %q", got)
 	}
 }
 
 // TestArenaResetReusesChunks verifies Reset rewinds rather than drops the backing:
-// the chunk count does not grow when re-interning the same workload after Reset.
+// the chunk count does not grow when storing the same workload again after Reset.
 func TestArenaResetReusesChunks(t *testing.T) {
 	var a StringArena
 	fill := func() {
 		for range 2000 {
-			a.Intern(strings.Repeat("a", 100))
+			a.AppendString(strings.Repeat("a", 100))
 		}
 	}
 	fill()
@@ -188,8 +188,8 @@ func Test_unit_Arena_Retained(t *testing.T) {
 	}
 	// Two chunk-filling strings -> two chunks; Reset rewinds but never shrinks —
 	// exactly the ratchet a trim policy has to judge.
-	a.Intern(string(make([]byte, defaultChunkBytes)))
-	a.Intern(string(make([]byte, defaultChunkBytes)))
+	a.AppendString(string(make([]byte, defaultChunkBytes)))
+	a.AppendString(string(make([]byte, defaultChunkBytes)))
 	two := a.Retained()
 	if two != 2*defaultChunkBytes {
 		t.Fatalf("retained %d, want %d", two, 2*defaultChunkBytes)
@@ -201,9 +201,9 @@ func Test_unit_Arena_Retained(t *testing.T) {
 	// An oversized string is a chunk of its own, so it counts while it is in flight — and
 	// stops counting at the Reset that drops it rather than recycling it.
 	oversize := defaultChunkBytes + 1
-	a.Intern(string(make([]byte, oversize)))
+	a.AppendString(string(make([]byte, oversize)))
 	if got := a.Retained(); got != two+oversize {
-		t.Fatalf("oversized intern: retained %d, want %d", got, two+oversize)
+		t.Fatalf("oversized store: retained %d, want %d", got, two+oversize)
 	}
 	a.Reset()
 	if got := a.Retained(); got != two {
@@ -313,11 +313,12 @@ func Test_unit_Arena_ChunkBudgetIsBytes(t *testing.T) {
 	assert.Zero(t, empty.Size(), "zero-width elements occupy no bytes")
 }
 
-// Test_unit_StringArena_StrRefAndStr covers the descriptor path for strings. A caller that
-// retains a great many of them wants Ref[byte] rather than string headers, so StrRef has to
-// round-trip through Str across a chunk boundary, past a whole chunk, and for the empty
-// string — and has to interoperate with the byte side, since it is the same descriptor.
-func Test_unit_StringArena_StrRefAndStr(t *testing.T) {
+// Test_unit_StringArena_AppendStringRefAndStringValue covers the descriptor path for strings.
+// A caller retaining many strings wants Ref[byte] rather than string headers, so
+// AppendStringRef has to round-trip through StringValue across a chunk boundary, past a
+// whole chunk, and for the empty string. It must also interoperate with the byte side,
+// since it is the same descriptor.
+func Test_unit_StringArena_AppendStringRefAndStringValue(t *testing.T) {
 	const chunk = 1 << 12
 	a := NewStringArena(chunk)
 
@@ -325,7 +326,7 @@ func Test_unit_StringArena_StrRefAndStr(t *testing.T) {
 	refs := make([]Ref[byte], 0, 202)
 	add := func(s string) {
 		want = append(want, s)
-		refs = append(refs, a.StrRef(s))
+		refs = append(refs, a.AppendStringRef(s))
 	}
 	for i := range 200 {
 		add(fmt.Sprintf("label-%d-%s", i, strings.Repeat("y", 100)))
@@ -335,18 +336,18 @@ func Test_unit_StringArena_StrRefAndStr(t *testing.T) {
 	add("")
 
 	require.Greater(t, a.Retained(), chunk, "the fixture must span more than one chunk")
-	// Checked after every StrRef, so a descriptor taken early must survive the chunks
+	// Checked after every AppendStringRef, so a descriptor taken early must survive the chunks
 	// added behind it.
 	for i, r := range refs {
-		assert.Equal(t, want[i], a.Str(r), "value %d must read back whole", i)
+		assert.Equal(t, want[i], a.StringValue(r), "value %d must read back whole", i)
 	}
 
-	assert.True(t, a.StrRef("").Empty(), "the empty string is the absent descriptor")
-	assert.Equal(t, "", a.Str(Ref[byte]{}), "the absent descriptor resolves to the empty string")
+	assert.True(t, a.AppendStringRef("").Empty(), "the empty string is the absent descriptor")
+	assert.Equal(t, "", a.StringValue(Ref[byte]{}), "the absent descriptor resolves to the empty string")
 
-	// StrRef hands out the same descriptor AppendRef does, so the two sides interoperate.
-	assert.Equal(t, "raw", a.Str(a.AppendRef([]byte("raw"))))
-	assert.Equal(t, []byte("via StrRef"), a.Value(a.StrRef("via StrRef")))
+	// AppendStringRef hands out the same descriptor AppendRef does, so the two sides interoperate.
+	assert.Equal(t, "raw", a.StringValue(a.AppendRef([]byte("raw"))))
+	assert.Equal(t, []byte("via AppendStringRef"), a.Value(a.AppendStringRef("via AppendStringRef")))
 }
 
 // Test_unit_Arena_ResetDropsOversizedChunks is the boundary between the two rewinds. A
@@ -604,6 +605,6 @@ func Test_unit_Make(t *testing.T) {
 
 	// And StringArena takes its chunk size the same way, as its doc claims.
 	sa := StringArena{Arena: Make[byte](chunk)}
-	assert.Equal(t, "hello", sa.Intern("hello"))
+	assert.Equal(t, "hello", sa.AppendString("hello"))
 	assert.Equal(t, chunk, sa.Retained())
 }

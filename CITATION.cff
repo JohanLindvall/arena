@@ -5,11 +5,14 @@ message: If you use this software, please cite it as below.
 type: software
 title: arena
 abstract: >-
-  Reusable batch storage for Go slices and strings, with 12-byte pointer-free
-  references. Values that share a lifetime are packed into reusable chunks
-  and returned as ordinary Go views. Reset reuses storage for the next batch,
-  while pointer-free descriptors keep retained references out of the garbage
-  collector's scan.
+  Reusable batch storage for Go slices and strings, reducing allocation and GC
+  scanning overhead with 12-byte pointer-free references. Values that share a
+  lifetime are packed into reusable chunks and returned as ordinary Go views.
+  Reset reuses storage for the next batch. Holding millions of strings as
+  AppendStringRef descriptors and resolving them with StringValue as needed
+  removes per-string pointer scanning and its CPU cost on each garbage
+  collection cycle. Byte chunks and descriptor arrays contain no pointers;
+  chunk headers and live string views still need scanning.
 authors:
   - family-names: Lindvall
     given-names: Johan

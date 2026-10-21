@@ -9,7 +9,7 @@ import (
 	"github.com/JohanLindvall/arena"
 )
 
-// A batch-lifetime workload: intern the batch's values, use the views, then rewind
+// A batch-lifetime workload: store the batch's values, use the views, then rewind
 // the arena and run the next batch over the same chunks.
 func Example() {
 	var a arena.StringArena // the zero value is usable, with 64 KiB chunks
@@ -17,16 +17,16 @@ func Example() {
 	for batch := range 2 {
 		labels := make([]string, 0, 3)
 		for _, key := range []string{"container_id", "level", "namespace"} {
-			labels = append(labels, a.Intern(key)) // copies key into the arena
+			labels = append(labels, a.AppendString(key)) // copies key into the arena
 		}
-		fmt.Printf("batch %d: %v, %d bytes interned\n", batch, labels, a.Size())
+		fmt.Printf("batch %d: %v, %d bytes stored\n", batch, labels, a.Size())
 
 		// All uses of labels are finished before reusing their storage.
 		a.Reset()
 	}
 	// Output:
-	// batch 0: [container_id level namespace], 26 bytes interned
-	// batch 1: [container_id level namespace], 26 bytes interned
+	// batch 0: [container_id level namespace], 26 bytes stored
+	// batch 1: [container_id level namespace], 26 bytes stored
 }
 
 // Chunk size decides the tail waste, since a value that does not fit the current
@@ -39,15 +39,15 @@ func ExampleNew() {
 	// Output: a row too long to pack well into a small chunk (1048576 bytes retained)
 }
 
-// An interned view stays valid until Reset no matter how much is interned after it:
+// A stored view stays valid until Reset no matter how much is stored after it:
 // a value that does not fit the current chunk starts a new chunk rather than growing
 // one that already has views pointing into it.
-func ExampleStringArena_Intern() {
+func ExampleStringArena_AppendString() {
 	a := arena.NewStringArena(4096)
 
-	first := a.Intern("still here")
+	first := a.AppendString("still here")
 	for range 1000 {
-		a.Intern("filler, enough of it to force several new chunks")
+		a.AppendString("filler, enough of it to force several new chunks")
 	}
 
 	fmt.Println(first, "-", a.Retained() > 4096, "chunks were added after it")
@@ -56,20 +56,20 @@ func ExampleStringArena_Intern() {
 
 // Copy a view before Reset when it needs to outlive the batch. Assigning the view
 // to another variable would still refer to the arena's storage.
-func ExampleStringArena_Intern_clone() {
+func ExampleStringArena_AppendString_clone() {
 	var a arena.StringArena
-	view := a.Intern("keep me")
+	view := a.AppendString("keep me")
 	owned := strings.Clone(view)
 	a.Reset()
-	a.Intern("next batch")
+	a.AppendString("next batch")
 	fmt.Println(owned)
 	// Output: keep me
 }
 
 // Ref is the descriptor form: a chunk index and a range, with no pointer in it. A
-// []Ref is allocated noscan, so a caller holding millions of them across a batch
-// costs the collector nothing, where the []byte Append returns would put a pointer
-// in every element and turn that slice into scan work on every cycle.
+// []Ref backing array needs no pointer scanning. Holding millions of Append views
+// in a [][]byte instead would put a pointer in every element and turn that slice
+// into scan work on every GC cycle.
 func ExampleArena_AppendRef() {
 	var a arena.Arena[byte]
 
@@ -126,18 +126,23 @@ func ExampleArena() {
 	// Output: [{1 0.5} {2 1.5}] - 32 bytes stored, 4096 retained
 }
 
-// StrRef and Str are the descriptor form of Intern: the arena still owns the bytes, but
-// what the caller retains is 12 pointer-free bytes rather than a string header.
-func ExampleStringArena_StrRef() {
+// AppendStringRef and StringValue are the descriptor form of AppendString: the arena still
+// owns the bytes, but what the caller retains is 12 pointer-free bytes rather than a string
+// header.
+//
+// For a batch holding millions of strings, retaining []Ref[byte] and resolving views only
+// as needed removes per-string GC scanning and its CPU cost. A []string of AppendString
+// results would still need scanning on every GC cycle.
+func ExampleStringArena_AppendStringRef() {
 	a := arena.NewStringArena(4096)
 
 	refs := make([]arena.Ref[byte], 0, 3)
 	for _, s := range []string{"container_id", "level", ""} {
-		refs = append(refs, a.StrRef(s))
+		refs = append(refs, a.AppendStringRef(s))
 	}
 
 	for _, r := range refs {
-		fmt.Printf("%q empty=%v\n", a.Str(r), r.Empty())
+		fmt.Printf("%q empty=%v\n", a.StringValue(r), r.Empty())
 	}
 	// Output:
 	// "container_id" empty=false
